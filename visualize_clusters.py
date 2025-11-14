@@ -92,6 +92,11 @@ class ClusterVisualizer:
         self.linkage_matrix = results.get('linkage_matrix')
         self.clusters = results['clusters']
         self.event_types = results.get('event_types', list(self.encoder.classes_))
+        self.cluster_metadata = results.get('cluster_metadata', {}) or {}
+        self.silhouette_lookup = self.cluster_metadata.get('silhouette_per_cluster', {}) or {}
+        self.overall_silhouette = self.cluster_metadata.get('silhouette_overall')
+        self.ast_similarity_lookup = self.cluster_metadata.get('ast_similarity', {}) or {}
+        self.ast_counts_lookup = self.cluster_metadata.get('ast_counts', {}) or {}
 
         print(f"Loaded {len(self.traces)} traces with {len(self.event_types)} event types")
 
@@ -158,6 +163,10 @@ class ClusterVisualizer:
                 'y': coords[1],
                 'z': coords[2] if len(coords) > 2 else 0.0,
                 'cluster': trace['cluster'],
+                'cluster_similarity': self.get_cluster_silhouette(trace.get('cluster')),
+                'silhouette_score': trace.get('silhouette_score'),
+                'ast_similarity': trace.get('ast_similarity'),
+                'has_ast': bool(trace.get('ast_unit_vector')),
                 'script_url': url,
                 'page_url': trace.get('page_url'),
                 'domain': domain,
@@ -333,6 +342,17 @@ class ClusterVisualizer:
                 return trace
         return None
 
+    def get_cluster_ast_similarity(self, cluster_id):
+        if cluster_id is None:
+            return None
+        return self.ast_similarity_lookup.get(cluster_id)
+
+    def get_cluster_silhouette(self, cluster_id):
+        """Return stored silhouette average for a cluster"""
+        if cluster_id is None:
+            return None
+        return self.silhouette_lookup.get(cluster_id)
+
     def create_app(self):
         """Create Dash application"""
         app = dash.Dash(__name__)
@@ -380,7 +400,8 @@ class ClusterVisualizer:
 
                     html.Div([
                         html.Strong("Instructions: "),
-                        html.Span("Click on any point to view trace details, event sequence, and JavaScript code")
+                        html.Span("Click on any point to view trace details, event sequence, and JavaScript code. "),
+                        html.Span("Use the legend to toggle or isolate clusters (double-click focuses on one).")
                     ], style={'marginTop': 10, 'padding': 10, 'backgroundColor': '#f0f0f0', 'borderRadius': 5})
                 ], style={'width': '48%', 'display': 'inline-block', 'verticalAlign': 'top', 'padding': 10}),
 
@@ -412,6 +433,10 @@ class ClusterVisualizer:
             df['hover_text'] = df.apply(
                 lambda row: f"<b>{row['domain']}</b><br>" +
                             f"Cluster: {row['cluster']}<br>" +
+                            (f"Avg similarity: {row['cluster_similarity']:.3f}<br>"
+                             if pd.notna(row['cluster_similarity']) else "") +
+                            (f"AST similarity: {row['ast_similarity']:.3f}<br>"
+                             if pd.notna(row['ast_similarity']) else "AST similarity: n/a<br>") +
                             f"Events: {row['num_events']}<br>" +
                             f"Script ID: {row['script_id']}<br>" +
                             f"URL: {row['script_url'][:60]}...",
@@ -421,20 +446,36 @@ class ClusterVisualizer:
             axis_base = self.embedding_method or "t-SNE"
 
             if color_by == 'cluster':
-                color_discrete = {cluster: colors[i % len(colors)]
-                                  for i, cluster in enumerate(sorted(df['cluster'].unique()))}
+                fig = go.Figure()
+                for i, cluster in enumerate(sorted(df['cluster'].unique())):
+                    cluster_df = df[df['cluster'] == cluster]
+                    fig.add_trace(
+                        go.Scatter3d(
+                            x=cluster_df['x'],
+                            y=cluster_df['y'],
+                            z=cluster_df['z'],
+                            mode='markers',
+                            name=f"Cluster {cluster}",
+                            marker=dict(
+                                color=colors[i % len(colors)],
+                                size=point_size,
+                                line=dict(width=0.5, color='white')
+                            ),
+                            text=cluster_df['hover_text'],
+                            hovertemplate="%{text}<extra></extra>",
+                            customdata=cluster_df[['trace_id']].to_numpy()
+                        )
+                    )
 
-                fig = px.scatter_3d(
-                    df,
-                    x='x',
-                    y='y',
-                    z='z',
-                    color='cluster',
-                    hover_data={'x': False, 'y': False, 'z': False, 'cluster': True, 'trace_id': False},
-                    custom_data=['trace_id'],
-                    color_discrete_map=color_discrete,
+                fig.update_layout(
                     title=f'Script Clusters (n={len(df)})',
-                    labels={'cluster': 'Cluster ID'}
+                    legend=dict(
+                        title='Clusters',
+                        bgcolor='rgba(255,255,255,0.7)',
+                        bordercolor='rgba(0,0,0,0.1)',
+                        borderwidth=1,
+                        itemsizing='constant'
+                    )
                 )
 
             elif color_by == 'domain':
@@ -470,10 +511,11 @@ class ClusterVisualizer:
                     labels={'num_events': '# Events'}
                 )
 
-            fig.update_traces(
-                marker=dict(size=point_size, line=dict(width=0.5, color='white')),
-                hovertemplate='%{customdata[0]}<extra></extra>'
-            )
+            if color_by != 'cluster':
+                fig.update_traces(
+                    marker=dict(size=point_size, line=dict(width=0.5, color='white')),
+                    hovertemplate='%{customdata[0]}<extra></extra>'
+                )
 
             fig.update_layout(
                 scene=dict(
@@ -503,6 +545,26 @@ class ClusterVisualizer:
 
             if not trace:
                 return html.Div([html.P("Trace not found")])
+
+            cluster_similarity = self.get_cluster_silhouette(trace.get('cluster'))
+            trace_silhouette = trace.get('silhouette_score')
+            cluster_ast_similarity = self.get_cluster_ast_similarity(trace.get('cluster'))
+            trace_ast_similarity = trace.get('ast_similarity')
+            ast_fingerprint = trace.get('ast_fingerprint') or {}
+            ast_preview_text = trace.get('ast_preview')
+            ast_parser = ast_fingerprint.get('parser', 'unknown')
+            ast_cache_path = ast_fingerprint.get('__cache_path')
+
+            def format_metric(value):
+                if value is None:
+                    return "n/a"
+                try:
+                    value = float(value)
+                except (TypeError, ValueError):
+                    return "n/a"
+                if np.isnan(value):
+                    return "n/a"
+                return f"{value:.3f}"
 
             # Load JS code artifacts
             js_artifacts = self.load_js_code(trace)
@@ -571,6 +633,22 @@ class ClusterVisualizer:
                             html.Tr([html.Td(html.Strong("Trace ID:")), html.Td(trace['trace_id'])]),
                             html.Tr([html.Td(html.Strong("Script ID:")), html.Td(trace['script_id'])]),
                             html.Tr([html.Td(html.Strong("Cluster:")), html.Td(trace['cluster'], style={'color': 'blue', 'fontWeight': 'bold'})]),
+                            html.Tr([
+                                html.Td(html.Strong("Cluster Avg Similarity:")),
+                                html.Td(format_metric(cluster_similarity))
+                            ]),
+                            html.Tr([
+                                html.Td(html.Strong("Trace Silhouette Score:")),
+                                html.Td(format_metric(trace_silhouette))
+                            ]),
+                            html.Tr([
+                                html.Td(html.Strong("Cluster AST Similarity:")),
+                                html.Td(format_metric(cluster_ast_similarity))
+                            ]),
+                            html.Tr([
+                                html.Td(html.Strong("Trace AST Similarity:")),
+                                html.Td(format_metric(trace_ast_similarity))
+                            ]),
                             html.Tr([html.Td(html.Strong("Script URL:")), html.Td(trace['script_url'], style={'wordBreak': 'break-all'})]),
                             html.Tr([html.Td(html.Strong("File Name:")), html.Td(trace.get('file_name', 'N/A'))]),
                             html.Tr([html.Td(html.Strong("Number of Events:")), html.Td(trace['num_events'])]),
@@ -633,6 +711,30 @@ class ClusterVisualizer:
                     ], style={'marginBottom': 20}),
 
                     html.Div([
+                        html.H4("AST Fingerprint", style={'borderBottom': '2px solid #333', 'paddingBottom': 5}),
+                        html.Div([
+                            html.P(f"Nodes: {ast_fingerprint.get('num_nodes', 'n/a')} | "
+                                   f"Max depth: {ast_fingerprint.get('max_depth', 'n/a')}",
+                                   style={'fontFamily': 'monospace'}),
+                            html.P(f"Script hash: {ast_fingerprint.get('script_hash', 'n/a')}",
+                                   style={'fontFamily': 'monospace', 'wordBreak': 'break-all'})
+                        ], style={'marginTop': 10}),
+                        html.Div([
+                            html.Strong("Top node types"),
+                            html.Ul([
+                                html.Li(f"{node}: {count}", style={'fontFamily': 'monospace'})
+                                for node, count in sorted(
+                                    (ast_fingerprint.get('node_type_counts') or {}).items(),
+                                    key=lambda kv: kv[1],
+                                    reverse=True
+                                )[:8]
+                            ]) if ast_fingerprint.get('node_type_counts') else
+                            html.P("No AST fingerprint available for this script.",
+                                   style={'fontStyle': 'italic', 'color': '#6b7280'})
+                        ], style={'marginTop': 10})
+                    ], style={'marginBottom': 20}),
+
+                    html.Div([
                         html.H4("Event Timeline", style={'borderBottom': '2px solid #333', 'paddingBottom': 5}),
                         dcc.Graph(
                             figure=self.create_event_timeline(trace),
@@ -670,6 +772,36 @@ class ClusterVisualizer:
                 ]
             )
 
+            ast_tab = dcc.Tab(
+                label="AST Preview",
+                value='ast',
+                children=[
+                    html.Div([
+                        html.H4("Abstract Syntax Tree", style={'borderBottom': '2px solid #333', 'paddingBottom': 5}),
+                        html.Small(
+                            f"Parser: {ast_parser}" + (f" | Cache: {ast_cache_path}" if ast_cache_path else ""),
+                            style={'color': '#6b7280'}
+                        ),
+                        html.Pre(
+                            ast_preview_text or "AST preview not available for this script.",
+                            style={
+                                'padding': 12,
+                                'backgroundColor': '#0b1220',
+                                'color': '#e2e8f0',
+                                'borderRadius': 6,
+                                'fontFamily': 'Consolas, Monaco, monospace',
+                                'fontSize': '12px',
+                                'marginTop': 10,
+                                'maxHeight': '60vh',
+                                'overflowY': 'auto',
+                                'whiteSpace': 'pre',
+                                'lineHeight': '1.4'
+                            }
+                        )
+                    ])
+                ]
+            )
+
             events_tab = dcc.Tab(
                 label="CDP Events",
                 value='cdp',
@@ -700,7 +832,7 @@ class ClusterVisualizer:
             details = html.Div([
                 dcc.Tabs(
                     value='overview',
-                    children=[overview_tab, code_tab, events_tab],
+                    children=[overview_tab, code_tab, ast_tab, events_tab],
                     colors={'border': '#d1d5db', 'primary': '#111827', 'background': '#f9fafb'}
                 )
             ])

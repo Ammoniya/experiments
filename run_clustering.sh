@@ -3,6 +3,71 @@
 
 set -e
 
+DEFAULT_OUTPUT="clustering_results.pkl"
+
+show_help() {
+    cat <<'EOF'
+Usage: ./run_clustering.sh [OPTIONS] [MAX_SCRIPTS] [MIN_CLUSTER_SIZE]
+
+Options:
+  --use-cache          Skip recomputing clusters and reuse the last results file.
+  --no-cache           Force recomputing clusters even if a cache file exists.
+  -h, --help           Show this help message and exit.
+
+Environment:
+  USE_CACHE=1          Equivalent to providing --use-cache.
+
+Examples:
+  ./run_clustering.sh 250 10
+  USE_CACHE=1 ./run_clustering.sh --use-cache
+EOF
+}
+
+USE_CACHE="${USE_CACHE:-0}"
+POSITIONAL_ARGS=()
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --use-cache)
+            USE_CACHE=1
+            shift
+            ;;
+        --no-cache)
+            USE_CACHE=0
+            shift
+            ;;
+        -h|--help)
+            show_help
+            exit 0
+            ;;
+        --)
+            shift
+            break
+            ;;
+        -*)
+            echo "Unknown option: $1"
+            echo "Use --help to see available options."
+            exit 1
+            ;;
+        *)
+            POSITIONAL_ARGS+=("$1")
+            shift
+            ;;
+    esac
+done
+
+if [ ${#POSITIONAL_ARGS[@]} -ge 1 ]; then
+    MAX_SCRIPTS="${POSITIONAL_ARGS[0]}"
+else
+    MAX_SCRIPTS=100
+fi
+
+if [ ${#POSITIONAL_ARGS[@]} -ge 2 ]; then
+    MIN_CLUSTER_SIZE="${POSITIONAL_ARGS[1]}"
+else
+    MIN_CLUSTER_SIZE=5
+fi
+
 echo "========================================"
 echo "JavaScript Script Clustering Pipeline"
 echo "========================================"
@@ -10,12 +75,21 @@ echo ""
 
 # Configuration
 DATA_DIR="experiment_data"
-MAX_SCRIPTS=${1:-100}  # Default to 100 scripts for quick test
-MIN_CLUSTER_SIZE=${2:-5}   # Default to 5 as the minimum cluster size
-OUTPUT="clustering_results.pkl"
+OUTPUT="$DEFAULT_OUTPUT"
+
+echo "Configuration:"
+echo "  Data directory: $DATA_DIR"
+echo "  Max scripts: $MAX_SCRIPTS"
+echo "  Min cluster size: $MIN_CLUSTER_SIZE"
+if [ "$USE_CACHE" -eq 1 ]; then
+    echo "  Cache mode: enabled (expecting $OUTPUT)"
+else
+    echo "  Cache mode: disabled"
+fi
+echo ""
 
 # Step 1: Check dependencies
-echo "[1/4] Checking dependencies..."
+echo "[1/5] Checking dependencies..."
 python3 << 'EOF'
 import importlib.util as ilu
 import sys
@@ -68,23 +142,38 @@ if [ $? -ne 0 ]; then
     exit 1
 fi
 
-# Step 2: Run clustering
+# Step 2: Run clustering or reuse cache
 echo ""
-echo "[2/5] Running clustering pipeline..."
-echo "  Data directory: $DATA_DIR"
-echo "  Max scripts: $MAX_SCRIPTS"
-echo "  Min cluster size: $MIN_CLUSTER_SIZE"
-echo ""
+if [ "$USE_CACHE" -eq 1 ]; then
+    if [ -f "$OUTPUT" ]; then
+        echo "[2/5] Reusing cached clustering results..."
+        echo "  Cache file: $OUTPUT"
+    else
+        echo "[2/5] Cache requested but $OUTPUT was not found."
+        echo "       Falling back to full clustering run..."
+        USE_CACHE=0
+    fi
+fi
 
-python3 cluster_scripts.py \
-    --data-dir "$DATA_DIR" \
-    --max-scripts "$MAX_SCRIPTS" \
-    --min-cluster-size "$MIN_CLUSTER_SIZE" \
-    --output "$OUTPUT"
+if [ "$USE_CACHE" -eq 0 ]; then
+    echo "[2/5] Running clustering pipeline..."
+    echo "  Data directory: $DATA_DIR"
+    echo "  Max scripts: $MAX_SCRIPTS"
+    echo "  Min cluster size: $MIN_CLUSTER_SIZE"
+    echo ""
 
-if [ $? -ne 0 ]; then
-    echo "❌ Clustering failed!"
-    exit 1
+    python3 cluster_scripts.py \
+        --data-dir "$DATA_DIR" \
+        --max-scripts "$MAX_SCRIPTS" \
+        --min-cluster-size "$MIN_CLUSTER_SIZE" \
+        --output "$OUTPUT"
+
+    if [ $? -ne 0 ]; then
+        echo "❌ Clustering failed!"
+        exit 1
+    fi
+else
+    echo "  Skipping clustering step."
 fi
 
 # Step 3: Verify output

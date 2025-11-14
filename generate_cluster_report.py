@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import pickle
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -130,6 +131,14 @@ def script_path(trace: Dict[str, Any], data_dir: Path) -> str:
     return str(path)
 
 
+def format_metric(value: Any) -> str:
+    if isinstance(value, (int, float)):
+        if math.isnan(value):
+            return "n/a"
+        return f"{value:.3f}"
+    return "n/a"
+
+
 # --------------------------------------------------------------------------- #
 # Report generation
 # --------------------------------------------------------------------------- #
@@ -137,11 +146,19 @@ def script_path(trace: Dict[str, Any], data_dir: Path) -> str:
 def generate_report(results_path: Path, data_dir: Path) -> None:
     results = load_results(results_path)
     traces: List[Dict[str, Any]] = results["traces"]
+    cluster_metadata: Dict[str, Any] = results.get("cluster_metadata", {}) or {}
+    silhouette_lookup = cluster_metadata.get("silhouette_per_cluster", {}) or {}
+    overall_silhouette = cluster_metadata.get("silhouette_overall")
+    ast_similarity_lookup = cluster_metadata.get("ast_similarity", {}) or {}
+    ast_counts = cluster_metadata.get("ast_counts", {}) or {}
 
     clusters: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
     for trace in traces:
         cluster_id = int(trace.get("cluster", -1))
         clusters[cluster_id].append(trace)
+
+    if overall_silhouette is not None:
+        print(f"Overall silhouette (avg similarity across clusters): {overall_silhouette:.3f}\n")
 
     for cluster_id in sorted(clusters.keys()):
         members = clusters[cluster_id]
@@ -156,6 +173,20 @@ def generate_report(results_path: Path, data_dir: Path) -> None:
             if members else 0
         )
         print(f"Average events per script: {avg_events:.1f}\n")
+        sil_score = silhouette_lookup.get(cluster_id)
+        if sil_score is not None:
+            print(f"Average similarity (silhouette): {sil_score:.3f}\n")
+        else:
+            print("Average similarity (silhouette): n/a\n")
+        ast_score = ast_similarity_lookup.get(cluster_id)
+        ast_scripts = sum(1 for t in members if t.get("ast_unit_vector"))
+        ast_total = ast_counts.get(cluster_id, ast_scripts)
+        if ast_scripts >= 2 and isinstance(ast_score, (int, float)):
+            print(f"AST average similarity: {ast_score:.3f} ({ast_scripts}/{len(members)} scripts with AST)\n")
+        elif ast_scripts:
+            print(f"AST average similarity: n/a ({ast_scripts}/{len(members)} scripts with AST)\n")
+        else:
+            print("AST average similarity: n/a (no AST fingerprints)\n")
 
         print(format_counter(plugin_counts, "Cluster WordPress Plugins"))
         print(format_counter(theme_counts, "Cluster WordPress Themes"))
@@ -174,6 +205,20 @@ def generate_report(results_path: Path, data_dir: Path) -> None:
             print(f"   Module: {trace.get('is_module')}")
             print(f"   # Events: {trace.get('num_events')}")
             print(f"   Suspicious Events: {trace.get('suspicious_event_count', 0)}")
+            print(f"   Trace Silhouette: {format_metric(trace.get('silhouette_score'))}")
+            print(f"   Trace AST Similarity: {format_metric(trace.get('ast_similarity'))}")
+            ast_fp = trace.get('ast_fingerprint') or {}
+            if ast_fp:
+                node_count = ast_fp.get('num_nodes', 0)
+                max_depth = ast_fp.get('max_depth', 0)
+                print(f"   AST Nodes: {node_count} | Max Depth: {max_depth}")
+                node_counts = ast_fp.get('node_type_counts') or {}
+                top_nodes = sorted(node_counts.items(), key=lambda kv: kv[1], reverse=True)[:5]
+                if top_nodes:
+                    node_summary = ", ".join(f"{k}:{v}" for k, v in top_nodes)
+                    print(f"   AST Top Node Types: {node_summary}")
+            else:
+                print("   AST Fingerprint: unavailable")
             print("   Capability Counts:")
             print(f"        {summarize_capabilities(trace.get('capability_counts', {}))}")
             print("   Event Type Distribution:")

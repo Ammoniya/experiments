@@ -13,13 +13,16 @@ os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
 os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 
 import json
+import math
 import re
+import hashlib
 import numpy as np
 import pandas as pd
 from pathlib import Path
 from collections import defaultdict, Counter
 from urllib.parse import urlparse, parse_qs
 from sklearn.preprocessing import LabelEncoder
+from sklearn.metrics import silhouette_samples
 import hdbscan
 from multiprocessing import Pool, cpu_count
 import pickle
@@ -342,11 +345,43 @@ class ScriptClusterer:
                 parts.append("capture")
             if arg.get('isPassive'):
                 parts.append("passive")
+        elif base_type.startswith("Web Worker"):
+            url = arg.get('scriptURL') or self.extract_url_from_arg(arg)
+            bucket = self.categorize_url(url, script_domain)
+            if bucket:
+                parts.append(bucket)
+            host = self.extract_domain(url)
+            if host:
+                parts.append(f"host={host}")
+            path = self.short_path_from_url(url, max_len=60)
+            if path:
+                parts.append(f"path={path}")
+            worker_name = (arg.get('options') or {}).get('name') or arg.get('name')
+            if worker_name:
+                parts.append(f"name={worker_name}")
         elif base_type in NETWORK_EVENT_TYPES:
             url = self.extract_url_from_arg(arg)
             bucket = self.categorize_url(url, script_domain)
             if bucket:
                 parts.append(bucket)
+            host = self.extract_domain(url)
+            if host:
+                parts.append(f"host={host}")
+            path = self.short_path_from_url(url)
+            if path:
+                parts.append(f"path={path}")
+            method = (
+                arg.get('request', {}).get('method')
+                or arg.get('method')
+                or ((arg.get('options') or {}).get('method'))
+            )
+            if not method and isinstance(arg.get('arguments'), list):
+                for item in arg['arguments'][1:2]:
+                    if isinstance(item, dict) and item.get('method'):
+                        method = item['method']
+                        break
+            if method:
+                parts.append(f"method={method}")
         elif 'object' in arg or 'property' in arg:
             obj = arg.get('object')
             prop = arg.get('property')
@@ -354,6 +389,11 @@ class ScriptClusterer:
                 parts.append(str(obj))
             if prop:
                 parts.append(str(prop))
+                prop_lower = str(prop).lower()
+                if prop_lower in {'localstorage', 'sessionstorage'}:
+                    summary = self.summarize_storage_value(arg.get('value'))
+                    if summary:
+                        parts.append(f"keys={summary}")
 
         return "|".join(parts)
 
@@ -362,6 +402,9 @@ class ScriptClusterer:
         arg = self.get_event_argument(event)
         base_type = arg.get('type') or event.get('eventType')
         if not base_type:
+            return None
+
+        if base_type == 'consoleAPI':
             return None
 
         token = self.build_event_token(base_type, arg, trace_context)
@@ -441,6 +484,34 @@ class ScriptClusterer:
             return str(selector)
 
         return None
+
+    @staticmethod
+    def summarize_storage_value(value, max_items=3):
+        """Summarize stored keys/values for localStorage/sessionStorage operations."""
+        if isinstance(value, dict) and value:
+            keys = list(value.keys())[:max_items]
+            return ",".join(keys)
+        if isinstance(value, list) and value:
+            entries = [str(v) for v in value[:max_items]]
+            return ",".join(entries)
+        if isinstance(value, str) and value:
+            return value[:40]
+        return None
+
+    @staticmethod
+    def short_path_from_url(url, max_len=40):
+        if not url:
+            return None
+        try:
+            parsed = urlparse(url)
+        except Exception:
+            return None
+        path = parsed.path or ''
+        if not path:
+            return None
+        if len(path) > max_len:
+            return path[:max_len - 1] + '…'
+        return path
 
     @staticmethod
     def extract_wp_version_from_url(url):
@@ -571,6 +642,90 @@ class ScriptClusterer:
             print(f"Error loading JS from {js_path}: {e}")
             return None
 
+    @staticmethod
+    def compute_script_hash(js_path):
+        """Compute SHA256 for a JavaScript file."""
+        try:
+            h = hashlib.sha256()
+            with open(js_path, 'rb') as f:
+                for chunk in iter(lambda: f.read(1 << 20), b''):
+                    h.update(chunk)
+            return h.hexdigest()
+        except Exception as exc:  # noqa: BLE001
+            print(f"Failed to hash {js_path}: {exc}")
+            return None
+
+    def load_ast_fingerprint(self, url_hash, timestamp, script_metadata):
+        """Load cached AST fingerprint data for a script."""
+        ast_dir = self.experiment_data_dir / url_hash / timestamp / 'loaded_js_asts'
+        if not ast_dir.exists():
+            return None
+
+        script_hash = script_metadata.get('hash')
+        candidates = []
+        if script_hash:
+            candidates.append(ast_dir / f"ast_{script_hash}.json")
+
+        file_name = script_metadata.get('file_name')
+        js_path = None
+        if file_name:
+            js_path = self.experiment_data_dir / url_hash / timestamp / 'loaded_js' / file_name
+
+        if not script_hash and js_path and js_path.exists():
+            computed_hash = self.compute_script_hash(js_path)
+            if computed_hash:
+                candidates.append(ast_dir / f"ast_{computed_hash}.json")
+
+        for candidate in candidates:
+            if candidate.exists():
+                try:
+                    with open(candidate, 'r', encoding='utf-8') as f:
+                        data = json.load(f)
+                        data['__cache_path'] = str(candidate)
+                        return data
+                except Exception as exc:  # noqa: BLE001
+                    print(f"Error reading AST fingerprint at {candidate}: {exc}")
+                    return None
+        return None
+
+    @staticmethod
+    def build_ast_unit_vector(ast_data):
+        """Return a normalized node-type vector for cosine similarity."""
+        if not ast_data:
+            return None
+
+        unit_vector = ast_data.get('unit_vector')
+        if isinstance(unit_vector, dict) and unit_vector:
+            return {k: float(v) for k, v in unit_vector.items()}
+
+        raw_counts = ast_data.get('node_type_counts')
+        if not isinstance(raw_counts, dict) or not raw_counts:
+            return None
+
+        try:
+            norm = math.sqrt(sum(float(v) ** 2 for v in raw_counts.values()))
+        except Exception:
+            return None
+        if norm <= 0:
+            return None
+
+        return {k: float(v) / norm for k, v in raw_counts.items()}
+
+    def attach_ast_metadata(self, trace, url_hash, timestamp, script_metadata):
+        """Attach AST fingerprint metadata (if available) to the trace."""
+        ast_data = self.load_ast_fingerprint(url_hash, timestamp, script_metadata)
+        if ast_data:
+            trace['ast_fingerprint'] = ast_data
+            trace['ast_script_hash'] = ast_data.get('script_hash')
+            trace['ast_unit_vector'] = self.build_ast_unit_vector(ast_data)
+            trace['ast_preview'] = ast_data.get('ast_preview')
+        else:
+            trace['ast_fingerprint'] = None
+            trace['ast_script_hash'] = None
+            trace['ast_unit_vector'] = None
+            trace['ast_preview'] = None
+        trace['ast_similarity'] = None
+
     def load_fingerprint(self, url_hash, timestamp):
         """Load fingerprint metadata (including WP assets) if available."""
         fp_path = self.experiment_data_dir / url_hash / timestamp / 'fingerprint.json'
@@ -692,6 +847,8 @@ class ScriptClusterer:
                         'wordpress_themes': fingerprint.get('themes', []),
                         'page_url': fingerprint.get('url')
                     }
+
+                    self.attach_ast_metadata(trace, url_hash, timestamp, script_metadata)
 
                     self.traces.append(trace)
 
@@ -978,7 +1135,121 @@ class ScriptClusterer:
         if noise:
             print(f"  Noise (-1): {noise} scripts")
 
+        silhouette_scores = self.compute_silhouette_scores()
+        if silhouette_scores:
+            print("\nCluster silhouette (avg similarity) scores:")
+            for cluster_id in sorted(silhouette_scores):
+                print(f"  Cluster {cluster_id}: {silhouette_scores[cluster_id]:.3f}")
+            overall = self.cluster_metadata.get('silhouette_overall')
+            if overall is not None:
+                print(f"  Overall silhouette: {overall:.3f}")
+
+        ast_similarity = self.compute_ast_cluster_similarity()
+        if ast_similarity:
+            print("\nAST similarity (cosine vs. cluster centroid):")
+            for cluster_id in sorted(ast_similarity):
+                value = ast_similarity[cluster_id]
+                label = f"{value:.3f}" if value is not None else "n/a"
+                print(f"  Cluster {cluster_id}: {label}")
+
         return self.clusters
+
+    def compute_silhouette_scores(self):
+        """Compute and store per-cluster silhouette averages."""
+        if self.distance_matrix is None or self.clusters is None:
+            print("Silhouette computation skipped (missing distance matrix or clusters).")
+            return {}
+
+        clustered_mask = self.clusters != -1
+        valid_indices = np.where(clustered_mask)[0]
+        if len(valid_indices) == 0:
+            print("Silhouette computation skipped (no clustered samples).")
+            return {}
+
+        unique_clusters = np.unique(self.clusters[clustered_mask])
+        if unique_clusters.size < 2:
+            print("Silhouette computation skipped (need at least two clusters excluding noise).")
+            return {}
+
+        submatrix = self.distance_matrix[np.ix_(valid_indices, valid_indices)]
+        labels = self.clusters[clustered_mask]
+
+        try:
+            sample_scores = silhouette_samples(submatrix, labels, metric='precomputed')
+        except Exception as exc:  # noqa: BLE001
+            print(f"Silhouette computation failed: {exc}")
+            return {}
+
+        per_cluster = {}
+        for cluster_id in unique_clusters:
+            cluster_mask = labels == cluster_id
+            if not np.any(cluster_mask):
+                continue
+            per_cluster[int(cluster_id)] = float(sample_scores[cluster_mask].mean())
+
+        overall = float(sample_scores.mean()) if len(sample_scores) else None
+
+        for idx_list, trace_idx in enumerate(valid_indices):
+            self.traces[trace_idx]['silhouette_score'] = float(sample_scores[idx_list])
+        for trace_idx in np.where(~clustered_mask)[0]:
+            self.traces[trace_idx]['silhouette_score'] = None
+
+        self.cluster_metadata.setdefault('silhouette_per_cluster', {})
+        self.cluster_metadata['silhouette_per_cluster'].update(per_cluster)
+        if overall is not None:
+            self.cluster_metadata['silhouette_overall'] = overall
+
+        return per_cluster
+
+    def compute_ast_cluster_similarity(self):
+        """Compute average cosine similarity of AST vectors within each cluster."""
+        if self.clusters is None:
+            return {}
+
+        cluster_vectors = defaultdict(list)
+        for trace, cluster_id in zip(self.traces, self.clusters):
+            if cluster_id == -1:
+                continue
+            vec = trace.get('ast_unit_vector')
+            if not vec:
+                continue
+            cluster_vectors[int(cluster_id)].append((trace, vec))
+
+        ast_similarity = {}
+        ast_counts = {}
+        for cluster_id, items in cluster_vectors.items():
+            ast_counts[cluster_id] = len(items)
+            if len(items) < 2:
+                ast_similarity[cluster_id] = None
+                continue
+
+            centroid = defaultdict(float)
+            for _, vec in items:
+                for key, value in vec.items():
+                    centroid[key] += value
+
+            centroid_norm = math.sqrt(sum(val * val for val in centroid.values()))
+            if centroid_norm <= 0:
+                ast_similarity[cluster_id] = None
+                continue
+
+            centroid_unit = {k: v / centroid_norm for k, v in centroid.items()}
+            cluster_scores = []
+            for trace, vec in items:
+                score = 0.0
+                for key, value in vec.items():
+                    score += value * centroid_unit.get(key, 0.0)
+                trace['ast_similarity'] = score
+                cluster_scores.append(score)
+
+            ast_similarity[cluster_id] = float(sum(cluster_scores) / len(cluster_scores))
+
+        if ast_similarity:
+            self.cluster_metadata.setdefault('ast_similarity', {})
+            self.cluster_metadata['ast_similarity'].update(ast_similarity)
+            self.cluster_metadata['ast_counts'] = ast_counts
+
+        return ast_similarity
 
     def analyze_clusters(self):
         """Analyze cluster characteristics"""

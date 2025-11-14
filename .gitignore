@@ -13,3 +13,4 @@ virustotal_reports/
 .claude/
 .idea/
 clustering_results_traces.json
+cluster_report.txt
