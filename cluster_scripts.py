@@ -33,6 +33,7 @@ CAPABILITY_EXACT_MAP = {
     'XHR Response': 'NET_XHR',
     'Fetch Request': 'NET_FETCH',
     'Fetch Response': 'NET_FETCH',
+    'Beacon API Call': 'NET_BEACON',
     'WebSocket Connection': 'NET_WS',
     'WebSocket Send': 'NET_WS',
     'WebSocket Receive (onmessage)': 'NET_WS',
@@ -136,18 +137,36 @@ NETWORK_EVENT_TYPES = {
     'XHR Response',
     'Fetch Request',
     'Fetch Response',
+    'Beacon API Call',
     'WebSocket Connection',
     'WebSocket Send',
     'WebSocket Receive (onmessage)',
     'WebSocket Receive (addEventListener)',
     'Network.requestWillBeSent',
     'Network.responseReceived',
+    'networkRequest',
     'Script Src Set',
     'IFrame Src Set',
     'Image Src Set',
     'Link Href Set',
     'Form Submitted'
 }
+
+COOKIE_VALUE_ATTRIBUTES = {
+    'domain',
+    'path',
+    'expires',
+    'max-age',
+    'maxage',
+    'samesite',
+    'priority'
+}
+COOKIE_FLAG_ATTRIBUTES = {
+    'secure',
+    'httponly'
+}
+COOKIE_ATTRIBUTE_KEYS = COOKIE_VALUE_ATTRIBUTES | COOKIE_FLAG_ATTRIBUTES
+STACK_URL_PATTERN = re.compile(r'(https?://[^\s)]+)')
 
 WP_VERSION_PARAM_KEYS = (
     'ver', 'version', 'ao_version', 'v', 'wpv', 'tver', 'plugin_ver'
@@ -184,6 +203,18 @@ class ScriptClusterer:
             arg = args_values[0]
             if isinstance(arg, dict):
                 return arg
+        event_type = event.get('eventType')
+        if event_type and event_type != 'consoleAPI':
+            fallback = {
+                key: value
+                for key, value in event.items()
+                if key not in {'argsValues', 'timestamp', 'eventType'}
+            }
+            resource_type = fallback.pop('type', None)
+            if resource_type and resource_type != event_type:
+                fallback['resourceType'] = resource_type
+            fallback['type'] = event_type
+            return fallback
         return {}
 
     @staticmethod
@@ -252,6 +283,72 @@ class ScriptClusterer:
             if isinstance(value, str) and value:
                 return value
         return None
+
+    @staticmethod
+    def cookie_segments(cookie_value):
+        if not cookie_value or not isinstance(cookie_value, str):
+            return []
+        return [segment.strip() for segment in cookie_value.split(';') if segment.strip()]
+
+    @staticmethod
+    def summarize_cookie_keys(cookie_value, max_keys=3):
+        segments = ScriptClusterer.cookie_segments(cookie_value)
+        keys = []
+        for segment in segments:
+            if '=' not in segment:
+                continue
+            key = segment.split('=', 1)[0].strip()
+            if not key or key.lower() in COOKIE_ATTRIBUTE_KEYS:
+                continue
+            if key not in keys:
+                keys.append(key)
+            if len(keys) >= max_keys:
+                break
+        return ",".join(keys) if keys else None
+
+    @staticmethod
+    def extract_cookie_attribute(cookie_value, attr_name):
+        if not cookie_value or not isinstance(cookie_value, str):
+            return None
+        target = attr_name.lower()
+        segments = ScriptClusterer.cookie_segments(cookie_value)
+        for segment in segments:
+            if '=' in segment:
+                key, val = segment.split('=', 1)
+                if key.strip().lower() == target:
+                    return val.strip()
+            else:
+                flag = segment.strip().lower()
+                if flag == target:
+                    return target
+        return None
+
+    @staticmethod
+    def extract_cookie_flags(cookie_value):
+        segments = ScriptClusterer.cookie_segments(cookie_value)
+        flags = []
+        for segment in segments:
+            if '=' in segment:
+                continue
+            flag = segment.strip().lower()
+            if flag in COOKIE_FLAG_ATTRIBUTES and flag not in flags:
+                flags.append(flag)
+        return ",".join(flags) if flags else None
+
+    @staticmethod
+    def extract_stack_source(stack):
+        if not stack or not isinstance(stack, str):
+            return None
+        match = STACK_URL_PATTERN.search(stack)
+        if not match:
+            return None
+        url = match.group(1)
+        cleaned = re.sub(r':\d+(?::\d+)?$', '', url)
+        domain = ScriptClusterer.extract_domain(cleaned)
+        path = ScriptClusterer.short_path_from_url(cleaned, max_len=80)
+        if domain and path:
+            return f"{domain}{path}"
+        return domain or path
 
     def map_capability(self, base_type, arg, target_tag=None):
         if base_type in CAPABILITY_EXACT_MAP:
@@ -382,6 +479,42 @@ class ScriptClusterer:
                         break
             if method:
                 parts.append(f"method={method}")
+            resource_type = arg.get('resourceType')
+            if resource_type and resource_type != base_type:
+                parts.append(f"resource={resource_type}")
+            initiator_type = arg.get('initiatorType')
+            if initiator_type:
+                parts.append(f"initiator={initiator_type}")
+        elif base_type in {"Timeout (Function) Set", "Interval (Function) Set"}:
+            delay = arg.get('delay')
+            if delay is not None:
+                parts.append(f"delay={delay}")
+            source = self.extract_stack_source(arg.get('registrationStack'))
+            if source:
+                parts.append(f"source={source}")
+        elif base_type in {"Cookie Read", "Cookie Update"}:
+            cookie_value = arg.get('value')
+            keys = self.summarize_cookie_keys(cookie_value)
+            if keys:
+                parts.append(f"keys={keys}")
+            elif cookie_value == "":
+                parts.append("keys=empty")
+            domain = self.extract_cookie_attribute(cookie_value, 'domain')
+            if domain:
+                parts.append(f"domain={domain}")
+            path = self.extract_cookie_attribute(cookie_value, 'path')
+            if path:
+                parts.append(f"path={path}")
+            flags = self.extract_cookie_flags(cookie_value)
+            if flags:
+                parts.append(f"flags={flags}")
+        elif base_type == "IFrame Created (Potential Context Escape)":
+            iframe_number = arg.get('iframeNumber')
+            if iframe_number is not None:
+                parts.append(f"iframe={iframe_number}")
+            source = self.extract_stack_source(arg.get('registrationStack'))
+            if source:
+                parts.append(f"source={source}")
         elif 'object' in arg or 'property' in arg:
             obj = arg.get('object')
             prop = arg.get('property')
