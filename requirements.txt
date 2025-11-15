@@ -22,3 +22,4 @@ tqdm>=4.62.0
 esprima>=4.0.1
 tree_sitter>=0.25.0
 tree_sitter_javascript>=0.25.0
+gensim>=4.3.0

@@ -195,6 +195,9 @@ class ScriptClusterer:
         self.capability_clusters = None
         self.hdbscan_model = None
         self.max_sequence_length = max_sequence_length
+        self.token_embeddings = {}
+        self.embedding_dim = 0
+        self.semantic_cost_enabled = False
 
     @staticmethod
     def get_event_argument(event):
@@ -702,8 +705,27 @@ class ScriptClusterer:
         return plugins, themes
 
     @staticmethod
-    def categorical_dtw_distance(seq_a, seq_b):
-        """Compute DTW distance with 0/1 cost for categorical tokens."""
+    def _token_semantic_cost(token_a, token_b, token_embeddings=None):
+        """Return semantic substitution cost between two tokens."""
+        if token_a == token_b:
+            return 0.0
+
+        if token_embeddings:
+            vec_a = token_embeddings.get(token_a)
+            vec_b = token_embeddings.get(token_b)
+            if vec_a is not None and vec_b is not None:
+                similarity = float(np.dot(vec_a, vec_b))
+                # Numerical guard for rounding errors
+                similarity = max(-1.0, min(1.0, similarity))
+                return 1.0 - similarity
+
+        weight_a = ScriptClusterer.token_weight(token_a)
+        weight_b = ScriptClusterer.token_weight(token_b)
+        return max(weight_a, weight_b)
+
+    @staticmethod
+    def categorical_dtw_distance(seq_a, seq_b, token_embeddings=None):
+        """Compute DTW distance using semantic-aware substitution costs."""
         if not seq_a and not seq_b:
             return 0.0
         if not seq_a:
@@ -723,12 +745,7 @@ class ScriptClusterer:
             token_a = seq_a[i - 1]
             for j in range(1, len_b + 1):
                 token_b = seq_b[j - 1]
-                if token_a == token_b:
-                    cost = 0.0
-                else:
-                    weight_a = ScriptClusterer.token_weight(token_a)
-                    weight_b = ScriptClusterer.token_weight(token_b)
-                    cost = max(weight_a, weight_b)
+                cost = ScriptClusterer._token_semantic_cost(token_a, token_b, token_embeddings)
                 curr[j] = cost + min(
                     curr[j - 1],    # insertion
                     prev[j],        # deletion
@@ -1051,6 +1068,96 @@ class ScriptClusterer:
             lengths = [len(seq) for seq in self.sequences]
             print(f"Compressed sequence lengths - Min: {min(lengths)}, Max: {max(lengths)}, Mean: {np.mean(lengths):.1f}")
 
+        if self.sequences:
+            trained = self.train_token_embeddings()
+            if not trained:
+                print("Token embeddings unavailable; DTW will use categorical fallback costs.")
+        else:
+            self.token_embeddings = {}
+            self.semantic_cost_enabled = False
+
+    def train_token_embeddings(self, vector_size=64, window=5, min_count=1, epochs=15):
+        """Train lightweight Word2Vec embeddings to enable semantic DTW costs."""
+        sentences = [seq for seq in self.sequences if seq]
+        if not sentences:
+            self.token_embeddings = {}
+            self.embedding_dim = 0
+            self.semantic_cost_enabled = False
+            return False
+
+        unique_tokens = set()
+        for seq in sentences:
+            unique_tokens.update(seq)
+
+        if len(unique_tokens) < 2:
+            print("Not enough distinct tokens for embedding training. Skipping semantic DTW.")
+            self.token_embeddings = {}
+            self.embedding_dim = 0
+            self.semantic_cost_enabled = False
+            return False
+
+        print("\n=== Training Token Embeddings ===")
+        print(f"Token vocabulary size: {len(unique_tokens)} | Sequences: {len(sentences)}")
+
+        try:
+            from gensim.models import Word2Vec
+        except ImportError:
+            print("gensim is not installed; install it to enable semantic DTW.")
+            self.token_embeddings = {}
+            self.embedding_dim = 0
+            self.semantic_cost_enabled = False
+            return False
+
+        try:
+            worker_count = max(1, cpu_count() - 1)
+        except NotImplementedError:
+            worker_count = 1
+
+        worker_count = min(worker_count, len(sentences))
+
+        try:
+            model = Word2Vec(
+                sentences=sentences,
+                vector_size=vector_size,
+                window=window,
+                min_count=min_count,
+                sg=1,
+                epochs=epochs,
+                workers=worker_count,
+                negative=10,
+                sample=1e-3,
+                seed=42
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"Failed to train token embeddings: {exc}")
+            self.token_embeddings = {}
+            self.embedding_dim = 0
+            self.semantic_cost_enabled = False
+            return False
+
+        normalized_embeddings = {}
+        for token in model.wv.index_to_key:
+            vec = np.array(model.wv[token], dtype=np.float32)
+            norm = np.linalg.norm(vec)
+            if norm == 0:
+                continue
+            normalized_embeddings[token] = vec / norm
+
+        if not normalized_embeddings:
+            print("Embedding training produced no usable vectors.")
+            self.token_embeddings = {}
+            self.embedding_dim = 0
+            self.semantic_cost_enabled = False
+            return False
+
+        self.token_embeddings = normalized_embeddings
+        self.embedding_dim = next(iter(normalized_embeddings.values())).shape[0]
+        coverage = len(normalized_embeddings) / len(unique_tokens) * 100.0
+        self.semantic_cost_enabled = True
+
+        print(f"Embedding model trained (dim={self.embedding_dim}, coverage={coverage:.1f}% of tokens).")
+        return True
+
     def compute_capability_features(self):
         """Compute normalized capability count vectors for each trace."""
         capabilities = set()
@@ -1165,6 +1272,12 @@ class ScriptClusterer:
         if chunk_size is None or chunk_size <= 0:
             chunk_size = 500
 
+        embedding_lookup = self.token_embeddings if self.token_embeddings else None
+        if embedding_lookup:
+            print(f"Semantic DTW enabled with {len(embedding_lookup)} learned token vectors.")
+        else:
+            print("Semantic DTW disabled; using categorical costs.")
+
         # Auto-select worker count if not provided
         if num_workers is None:
             try:
@@ -1191,7 +1304,11 @@ class ScriptClusterer:
             with tqdm(total=total_pairs, desc="Computing distances") as pbar:
                 for chunk in chunk_generator():
                     for i, j in chunk:
-                        dist = self.categorical_dtw_distance(self.sequences[i], self.sequences[j])
+                        dist = ScriptClusterer.categorical_dtw_distance(
+                            self.sequences[i],
+                            self.sequences[j],
+                            embedding_lookup
+                        )
                         if max_distance and dist > max_distance:
                             dist = max_distance
                         self.distance_matrix[i, j] = dist
@@ -1199,7 +1316,7 @@ class ScriptClusterer:
                     pbar.update(len(chunk))
         else:
             with Pool(processes=num_workers, initializer=_init_dtw_worker,
-                      initargs=(self.sequences, max_distance)) as pool:
+                      initargs=(self.sequences, max_distance, embedding_lookup)) as pool:
                 with tqdm(total=total_pairs, desc="Computing distances") as pbar:
                     for chunk_result in pool.imap_unordered(_dtw_worker, chunk_generator()):
                         for i, j, dist in chunk_result:
@@ -1450,7 +1567,10 @@ class ScriptClusterer:
             'capability_vocab': self.capability_vocab,
             'capability_clusters': self.capability_clusters,
             'event_types': list(self.encoder.classes_),
-            'cluster_metadata': self.cluster_metadata
+            'cluster_metadata': self.cluster_metadata,
+            'token_embeddings': self.token_embeddings,
+            'embedding_dim': self.embedding_dim,
+            'semantic_cost_enabled': self.semantic_cost_enabled
         }
 
         with open(output_file, 'wb') as f:
@@ -1483,6 +1603,12 @@ class ScriptClusterer:
         clusterer.capability_vocab = results.get('capability_vocab', [])
         clusterer.capability_clusters = results.get('capability_clusters')
         clusterer.cluster_metadata = results.get('cluster_metadata', {})
+        clusterer.token_embeddings = results.get('token_embeddings', {})
+        clusterer.embedding_dim = results.get('embedding_dim', 0)
+        clusterer.semantic_cost_enabled = results.get(
+            'semantic_cost_enabled',
+            bool(clusterer.token_embeddings)
+        )
 
         return clusterer
 
@@ -1490,12 +1616,13 @@ class ScriptClusterer:
 _DTW_WORKER_CONTEXT = {}
 
 
-def _init_dtw_worker(sequences, max_distance):
+def _init_dtw_worker(sequences, max_distance, token_embeddings):
     """Initializer for DTW worker processes."""
     global _DTW_WORKER_CONTEXT
     _DTW_WORKER_CONTEXT = {
         'sequences': sequences,
-        'max_distance': max_distance
+        'max_distance': max_distance,
+        'token_embeddings': token_embeddings
     }
 
 
@@ -1503,9 +1630,10 @@ def _dtw_worker(pairs):
     """Worker function to compute DTW distances for a batch of index pairs."""
     sequences = _DTW_WORKER_CONTEXT['sequences']
     max_distance = _DTW_WORKER_CONTEXT['max_distance']
+    token_embeddings = _DTW_WORKER_CONTEXT.get('token_embeddings')
     results = []
     for i, j in pairs:
-        dist = ScriptClusterer.categorical_dtw_distance(sequences[i], sequences[j])
+        dist = ScriptClusterer.categorical_dtw_distance(sequences[i], sequences[j], token_embeddings)
         if max_distance and dist > max_distance:
             dist = max_distance
         results.append((i, j, dist))
