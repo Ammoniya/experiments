@@ -25,6 +25,14 @@ os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 import numpy as np
 import pandas as pd
 
+from subsequence_alignment_cache import (
+    cache_is_stale,
+    default_cache_path,
+    load_alignment_cache,
+)
+
+DTW_EVENT_PREVIEW = int(os.environ.get("DTW_EVENT_PREVIEW", "30"))
+
 TSNE_PERPLEXITY = max(2, int(os.environ.get("TSNE_PERPLEXITY", "30")))
 TSNE_RANDOM_STATE = int(os.environ.get("TSNE_RANDOM_STATE", "42"))
 
@@ -76,13 +84,14 @@ from sklearn.manifold import TSNE
 class ClusterVisualizer:
     """Interactive visualization for clustering results"""
 
-    def __init__(self, results_file, experiment_data_dir):
-        self.results_file = results_file
+    def __init__(self, results_file, experiment_data_dir, alignment_cache_file=None):
+        self.results_file = Path(results_file)
         self.experiment_data_dir = Path(experiment_data_dir)
+        self.alignment_cache_path = Path(alignment_cache_file) if alignment_cache_file else default_cache_path(self.results_file)
 
         # Load results
         print("Loading clustering results...")
-        with open(results_file, 'rb') as f:
+        with open(self.results_file, 'rb') as f:
             results = pickle.load(f)
 
         self.traces = results['traces']
@@ -108,6 +117,25 @@ class ClusterVisualizer:
         # Create DataFrame for easier manipulation
         self.df = self.create_dataframe()
         self.cluster_wp_cache = {}
+        self.trace_lookup = {}
+        for idx, trace in enumerate(self.traces):
+            trace['_index'] = idx
+            self.trace_lookup[trace['trace_id']] = idx
+
+        self.event_type_to_int = {label: idx for idx, label in enumerate(self.event_types)}
+        self.numeric_sequences = self._encode_sequences(self.sequences)
+        self.cluster_representatives = self._select_cluster_representatives()
+        self.ast_display_cache = self._build_ast_display_cache()
+        self.subsequence_cache, self.subsequence_cache_meta = load_alignment_cache(self.alignment_cache_path)
+        if not self.subsequence_cache:
+            print(
+                f"⚠ No subsequence alignment cache found at {self.alignment_cache_path}. "
+                "Run precompute_subsequence_alignments.py to cache DTW metadata."
+            )
+        elif cache_is_stale(self.subsequence_cache_meta, self.results_file):
+            print(
+                f"⚠ Alignment cache at {self.alignment_cache_path} may be stale relative to {self.results_file}."
+            )
 
     def compute_embeddings(self):
         """Compute 3D embeddings for visualization (t-SNE only, with fallback)."""
@@ -180,6 +208,65 @@ class ClusterVisualizer:
 
         return pd.DataFrame(data)
 
+    def _encode_sequences(self, sequences):
+        """Convert categorical event sequences into numeric arrays for DTW."""
+        encoded = []
+        fallback_value = -1.0
+        for seq in sequences:
+            if not seq:
+                encoded.append(np.array([], dtype=float))
+                continue
+            values = [float(self.event_type_to_int.get(evt, fallback_value)) for evt in seq]
+            encoded.append(np.array(values, dtype=float))
+        return encoded
+
+    def _select_cluster_representatives(self):
+        """Pick a representative trace per cluster (highest silhouette score)."""
+        representatives = {}
+        for idx, trace in enumerate(self.traces):
+            cluster_id = trace.get('cluster')
+            if cluster_id in (None, -1):
+                continue
+            sequence = self.numeric_sequences[idx]
+            if sequence.size == 0:
+                continue
+            silhouette = trace.get('silhouette_score')
+            score = float(silhouette) if silhouette is not None and not np.isnan(silhouette) else float('-inf')
+            best = representatives.get(cluster_id)
+            if best is None or score > best['score']:
+                representatives[cluster_id] = {
+                    'trace_index': idx,
+                    'trace_id': trace.get('trace_id'),
+                    'script_url': trace.get('script_url'),
+                    'score': score,
+                    'sequence': sequence,
+                    'event_sequence': trace.get('event_sequence') or self.sequences[idx],
+                    'num_events': trace.get('num_events'),
+                }
+        return representatives
+
+    def _build_ast_display_cache(self):
+        """Prepare lightweight AST summaries so click callbacks stay fast."""
+        cache = {}
+        for trace in self.traces:
+            trace_id = trace.get('trace_id')
+            if not trace_id:
+                continue
+            ast_fp = trace.get('ast_fingerprint') or {}
+            node_counts = ast_fp.get('node_type_counts') or {}
+            top_nodes = sorted(node_counts.items(), key=lambda kv: kv[1], reverse=True)[:8]
+            cache[trace_id] = {
+                'has_ast': bool(ast_fp),
+                'num_nodes': ast_fp.get('num_nodes'),
+                'max_depth': ast_fp.get('max_depth'),
+                'script_hash': ast_fp.get('script_hash'),
+                'parser': ast_fp.get('parser', 'unknown'),
+                'cache_path': ast_fp.get('__cache_path'),
+                'preview': trace.get('ast_preview') or ast_fp.get('ast_preview'),
+                'top_nodes': top_nodes,
+            }
+        return cache
+
     @staticmethod
     def _format_wp_label(item):
         if not isinstance(item, dict):
@@ -191,6 +278,16 @@ class ClusterVisualizer:
         if version:
             return f"{name} ({version})"
         return name
+
+    @staticmethod
+    def _format_event_preview(events, limit=DTW_EVENT_PREVIEW):
+        """Return a compact arrow-separated preview of events."""
+        if not events:
+            return "(no events)"
+        preview = ' → '.join(events[:limit])
+        if len(events) > limit:
+            preview += ' → ...'
+        return preview
 
     def get_cluster_wp_distribution(self, cluster_id):
         """Return cached plugin/theme counters for a cluster."""
@@ -337,10 +434,10 @@ class ClusterVisualizer:
 
     def get_trace_by_id(self, trace_id):
         """Get trace by trace_id"""
-        for trace in self.traces:
-            if trace['trace_id'] == trace_id:
-                return trace
-        return None
+        idx = self.trace_lookup.get(trace_id)
+        if idx is None:
+            return None
+        return self.traces[idx]
 
     def get_cluster_ast_similarity(self, cluster_id):
         if cluster_id is None:
@@ -352,6 +449,67 @@ class ClusterVisualizer:
         if cluster_id is None:
             return None
         return self.silhouette_lookup.get(cluster_id)
+
+    def compute_subsequence_alignment(self, trace):
+        """Return cached alignment results for a trace."""
+        trace_id = trace.get('trace_id')
+        if not trace_id:
+            return {'error': 'Trace ID missing; cannot fetch cached alignment.'}
+
+        if not self.subsequence_cache:
+            return {
+                'error': (
+                    f"No subsequence alignment cache loaded (expected {self.alignment_cache_path}). "
+                    "Run precompute_subsequence_alignments.py to build it."
+                )
+            }
+
+        cached = self.subsequence_cache.get(trace_id)
+        if cached:
+            return cached
+
+        return {
+            'error': (
+                'Trace missing from subsequence alignment cache. '
+                'Rebuild the cache after rerunning clustering.'
+            )
+        }
+
+    def _build_warping_paths_figure(self, alignment_info):
+        """Create a Plotly heatmap showing warping paths if the matrix is available."""
+        warping_paths = alignment_info.get('warping_paths')
+        if warping_paths is None:
+            return None
+
+        path = alignment_info.get('path') or []
+        fig = go.Figure()
+        fig.add_trace(go.Heatmap(
+            z=warping_paths,
+            colorscale='Viridis',
+            colorbar=dict(title='Cost'),
+            hovertemplate='Query %{y}<br>Series %{x}<br>Cost %{z}<extra></extra>',
+            name='Cost matrix'
+        ))
+
+        if path:
+            fig.add_trace(go.Scatter(
+                x=[col for _, col in path],
+                y=[row for row, _ in path],
+                mode='lines+markers',
+                line=dict(color='#dc2626', width=2),
+                marker=dict(size=4, color='#dc2626'),
+                name='Warping path'
+            ))
+
+        fig.update_layout(
+            title='Subsequence DTW Warping Paths',
+            xaxis_title='Series Index',
+            yaxis_title='Query Index',
+            template='plotly_white',
+            margin=dict(l=40, r=10, t=60, b=40),
+            height=450
+        )
+        return fig
 
     def create_app(self):
         """Create Dash application"""
@@ -550,10 +708,17 @@ class ClusterVisualizer:
             trace_silhouette = trace.get('silhouette_score')
             cluster_ast_similarity = self.get_cluster_ast_similarity(trace.get('cluster'))
             trace_ast_similarity = trace.get('ast_similarity')
-            ast_fingerprint = trace.get('ast_fingerprint') or {}
-            ast_preview_text = trace.get('ast_preview')
-            ast_parser = ast_fingerprint.get('parser', 'unknown')
-            ast_cache_path = ast_fingerprint.get('__cache_path')
+            ast_display = self.ast_display_cache.get(trace_id, {}) or {}
+            ast_preview_text = ast_display.get('preview')
+            ast_parser = ast_display.get('parser', 'unknown')
+            ast_cache_path = ast_display.get('cache_path')
+            ast_top_nodes = ast_display.get('top_nodes') or []
+            ast_node_count = ast_display.get('num_nodes', 'n/a')
+            ast_max_depth = ast_display.get('max_depth', 'n/a')
+            ast_script_hash = ast_display.get('script_hash', 'n/a')
+            has_ast_data = ast_display.get('has_ast', False)
+
+            alignment_info = self.compute_subsequence_alignment(trace)
 
             def format_metric(value):
                 if value is None:
@@ -565,6 +730,17 @@ class ClusterVisualizer:
                 if np.isnan(value):
                     return "n/a"
                 return f"{value:.3f}"
+
+            def format_percentage(value):
+                if value is None:
+                    return "n/a"
+                try:
+                    value = float(value)
+                except (TypeError, ValueError):
+                    return "n/a"
+                if np.isnan(value):
+                    return "n/a"
+                return f"{value * 100:.1f}%"
 
             # Load JS code artifacts
             js_artifacts = self.load_js_code(trace)
@@ -712,26 +888,25 @@ class ClusterVisualizer:
 
                     html.Div([
                         html.H4("AST Fingerprint", style={'borderBottom': '2px solid #333', 'paddingBottom': 5}),
-                        html.Div([
-                            html.P(f"Nodes: {ast_fingerprint.get('num_nodes', 'n/a')} | "
-                                   f"Max depth: {ast_fingerprint.get('max_depth', 'n/a')}",
+                        (html.Div([
+                            html.P(f"Nodes: {ast_node_count} | Max depth: {ast_max_depth}",
                                    style={'fontFamily': 'monospace'}),
-                            html.P(f"Script hash: {ast_fingerprint.get('script_hash', 'n/a')}",
+                            html.P(f"Script hash: {ast_script_hash}",
                                    style={'fontFamily': 'monospace', 'wordBreak': 'break-all'})
-                        ], style={'marginTop': 10}),
-                        html.Div([
+                        ], style={'marginTop': 10})
+                         if has_ast_data else
+                         html.P("No AST fingerprint available for this script.",
+                                style={'fontStyle': 'italic', 'color': '#6b7280', 'marginTop': 10})),
+                        ((html.Div([
                             html.Strong("Top node types"),
                             html.Ul([
                                 html.Li(f"{node}: {count}", style={'fontFamily': 'monospace'})
-                                for node, count in sorted(
-                                    (ast_fingerprint.get('node_type_counts') or {}).items(),
-                                    key=lambda kv: kv[1],
-                                    reverse=True
-                                )[:8]
-                            ]) if ast_fingerprint.get('node_type_counts') else
-                            html.P("No AST fingerprint available for this script.",
+                                for node, count in ast_top_nodes
+                            ]) if ast_top_nodes else
+                            html.P("Node type histogram unavailable.",
                                    style={'fontStyle': 'italic', 'color': '#6b7280'})
                         ], style={'marginTop': 10})
+                         ) if has_ast_data else html.Div())
                     ], style={'marginBottom': 20}),
 
                     html.Div([
@@ -742,6 +917,103 @@ class ClusterVisualizer:
                             style={'height': '250px'}
                         )
                     ], style={'marginBottom': 20})
+                ]
+            )
+
+            dtw_children = []
+            if not alignment_info:
+                dtw_children.append(html.P(
+                    "Subsequence alignment is unavailable for this trace.",
+                    style={'fontStyle': 'italic'}
+                ))
+            elif alignment_info.get('error'):
+                dtw_children.append(html.Div([
+                    html.H4("Alignment unavailable", style={'color': '#991b1b'}),
+                    html.P(alignment_info['error'])
+                ], style={'padding': 10, 'backgroundColor': '#fee2e2', 'borderRadius': 6}))
+            else:
+                coverage_pct = format_percentage(alignment_info.get('coverage_ratio'))
+                tail_ratio = None
+                if alignment_info.get('series_length'):
+                    tail_ratio = alignment_info['tail_length'] / alignment_info['series_length']
+                tail_pct = format_percentage(tail_ratio)
+                summary_rows = [
+                    html.Tr([html.Td(html.Strong("Reference Trace:")),
+                             html.Td(f"{alignment_info['representative_trace_id']} "
+                                     f"({alignment_info.get('representative_num_events', 'n/a')} events)")]),
+                    html.Tr([html.Td(html.Strong("Reference URL:")),
+                             html.Td(alignment_info.get('representative_script_url', 'Unavailable'),
+                                     style={'wordBreak': 'break-all'})]),
+                    html.Tr([html.Td(html.Strong("Matched Segment:")),
+                             html.Td(f"{alignment_info['start_index']} → {alignment_info['end_index']}")]),
+                    html.Tr([html.Td(html.Strong("Matched Length:")),
+                             html.Td(f"{alignment_info['matched_length']} / {alignment_info['series_length']} events")]),
+                    html.Tr([html.Td(html.Strong("Coverage:")),
+                             html.Td(coverage_pct)]),
+                    html.Tr([html.Td(html.Strong("Tail Length:")),
+                             html.Td(f"{alignment_info['tail_length']} ({tail_pct})")]),
+                    html.Tr([html.Td(html.Strong("DTW Distance:")),
+                             html.Td(format_metric(alignment_info.get('distance')))]),
+                    html.Tr([html.Td(html.Strong("Normalized Cost:")),
+                             html.Td(format_metric(alignment_info.get('normalized_distance')))]),
+                ]
+                dtw_children.append(html.Div([
+                    html.H4("Alignment Summary", style={'borderBottom': '2px solid #333', 'paddingBottom': 5}),
+                    html.Table(summary_rows, style={'width': '100%', 'marginTop': 10})
+                ], style={'marginBottom': 20}))
+
+                preview_cards = [
+                    ("Leading Events",
+                     self._format_event_preview(alignment_info.get('leading_events')),
+                     '#f1f5f9'),
+                    ("Matched Subsequence",
+                     self._format_event_preview(alignment_info.get('matched_events')),
+                     '#e0f2fe'),
+                    ("Tail / Append Events",
+                     self._format_event_preview(alignment_info.get('tail_events')),
+                     '#fee2e2')
+                ]
+                previews = []
+                for title, text, bg in preview_cards:
+                    previews.append(html.Div([
+                        html.H5(title, style={'marginBottom': 6}),
+                        html.Div(text, style={
+                            'backgroundColor': bg,
+                            'padding': 10,
+                            'borderRadius': 6,
+                            'fontFamily': 'monospace',
+                            'fontSize': '12px',
+                            'whiteSpace': 'normal'
+                        })
+                    ], style={'flex': '1', 'minWidth': '0', 'marginRight': 10}))
+                dtw_children.append(html.Div(previews, style={'display': 'flex', 'gap': 10, 'marginBottom': 20}))
+
+                if alignment_info.get('tail_length'):
+                    dtw_children.append(html.Div([
+                        html.Strong("Append indicator:"),
+                        html.Span(
+                            f" {alignment_info['tail_length']} events fall outside the canonical subsequence.",
+                            style={'color': '#b91c1c'}
+                        )
+                    ], style={'marginBottom': 15}))
+
+                warping_fig = self._build_warping_paths_figure(alignment_info)
+                if warping_fig:
+                    dtw_children.append(dcc.Graph(
+                        figure=warping_fig,
+                        config={'displayModeBar': False}
+                    ))
+                elif alignment_info.get('warping_paths_reason'):
+                    dtw_children.append(html.P(
+                        alignment_info['warping_paths_reason'],
+                        style={'fontStyle': 'italic', 'color': '#6b7280'}
+                    ))
+
+            dtw_tab = dcc.Tab(
+                label="Subsequence DTW",
+                value='dtw',
+                children=[
+                    html.Div(dtw_children)
                 ]
             )
 
@@ -832,7 +1104,7 @@ class ClusterVisualizer:
             details = html.Div([
                 dcc.Tabs(
                     value='overview',
-                    children=[overview_tab, code_tab, ast_tab, events_tab],
+                    children=[overview_tab, dtw_tab, code_tab, ast_tab, events_tab],
                     colors={'border': '#d1d5db', 'primary': '#111827', 'background': '#f9fafb'}
                 )
             ])
@@ -935,11 +1207,14 @@ def main():
                         help='Host for Dash server')
     parser.add_argument('--no-server', action='store_true',
                         help='Build the Dash layout without launching the server')
+    parser.add_argument('--alignment-cache',
+                        help='Path to precomputed subsequence alignment cache '
+                             '(defaults to <results>_subsequence_cache.pkl)')
 
     args = parser.parse_args()
 
     # Create visualizer
-    visualizer = ClusterVisualizer(args.results, args.data_dir)
+    visualizer = ClusterVisualizer(args.results, args.data_dir, alignment_cache_file=args.alignment_cache)
 
     # Create app (even when skipping server so layout can be validated)
     app = visualizer.create_app()

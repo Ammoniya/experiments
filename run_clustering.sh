@@ -89,7 +89,7 @@ fi
 echo ""
 
 # Step 1: Check dependencies
-echo "[1/5] Checking dependencies..."
+echo "[1/6] Checking dependencies..."
 python3 << 'EOF'
 import importlib.util as ilu
 import sys
@@ -146,17 +146,17 @@ fi
 echo ""
 if [ "$USE_CACHE" -eq 1 ]; then
     if [ -f "$OUTPUT" ]; then
-        echo "[2/5] Reusing cached clustering results..."
+        echo "[2/6] Reusing cached clustering results..."
         echo "  Cache file: $OUTPUT"
     else
-        echo "[2/5] Cache requested but $OUTPUT was not found."
+        echo "[2/6] Cache requested but $OUTPUT was not found."
         echo "       Falling back to full clustering run..."
         USE_CACHE=0
     fi
 fi
 
 if [ "$USE_CACHE" -eq 0 ]; then
-    echo "[2/5] Running clustering pipeline..."
+    echo "[2/6] Running clustering pipeline..."
     echo "  Data directory: $DATA_DIR"
     echo "  Max scripts: $MAX_SCRIPTS"
     echo "  Min cluster size: $MIN_CLUSTER_SIZE"
@@ -178,7 +178,7 @@ fi
 
 # Step 3: Verify output
 echo ""
-echo "[3/5] Verifying output..."
+echo "[3/6] Verifying output..."
 if [ -f "$OUTPUT" ]; then
     echo "✓ Results saved to: $OUTPUT"
     SIZE=$(du -h "$OUTPUT" | cut -f1)
@@ -188,9 +188,18 @@ else
     exit 1
 fi
 
-# Step 4: Generate text report
+# Step 4: Precompute subsequence alignments
 echo ""
-echo "[4/5] Generating cluster report..."
+echo "[4/6] Precomputing subsequence alignment cache..."
+if python3 precompute_subsequence_alignments.py --results "$OUTPUT"; then
+    echo "✓ Subsequence DTW cache ready."
+else
+    echo "⚠ Failed to build subsequence alignment cache. Visualization will fall back to error messages."
+fi
+
+# Step 5: Generate text report
+echo ""
+echo "[5/6] Generating cluster report..."
 REPORT_FILE="cluster_report.txt"
 python3 generate_cluster_report.py --results "$OUTPUT" --data-dir "$DATA_DIR" > "$REPORT_FILE"
 if [ $? -ne 0 ]; then
@@ -199,9 +208,9 @@ if [ $? -ne 0 ]; then
 fi
 echo "✓ Cluster report saved to: $REPORT_FILE"
 
-# Step 5: Launch visualization
+# Step 6: Launch visualization
 echo ""
-echo "[5/5] Launching interactive visualization..."
+echo "[6/6] Launching interactive visualization..."
 echo ""
 
 VIZ_ARGS=()
