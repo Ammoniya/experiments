@@ -20,6 +20,7 @@ import numpy as np
 import pandas as pd
 from pathlib import Path
 from collections import defaultdict, Counter
+from functools import lru_cache
 from urllib.parse import urlparse, parse_qs
 from sklearn.preprocessing import LabelEncoder
 from sklearn.metrics import silhouette_samples
@@ -34,6 +35,9 @@ CAPABILITY_EXACT_MAP = {
     'Fetch Request': 'NET_FETCH',
     'Fetch Response': 'NET_FETCH',
     'Beacon API Call': 'NET_BEACON',
+    'Cache API Open': 'CACHE',
+    'Cache API Match': 'CACHE',
+    'Storage Event': 'STORAGE',
     'WebSocket Connection': 'NET_WS',
     'WebSocket Send': 'NET_WS',
     'WebSocket Receive (onmessage)': 'NET_WS',
@@ -48,6 +52,8 @@ CAPABILITY_EXACT_MAP = {
     'Document.writeln Call': 'DOM_INJECT_HTML',
     'HTML Property Write (Suspicious)': 'DOM_INJECT_HTML',
     'IFrame Src Set': 'DOM_INJECT_IFRAME',
+    'IFrame Created (Potential Context Escape)': 'DOM_INJECT_IFRAME',
+    'WARNING: Multiple IFrames Created': 'HOOK_EVASION',
     'Form Submitted': 'CREDENTIALS',
     'Sensitive Field Read': 'CREDENTIALS',
     'Sensitive Field Write': 'CREDENTIALS',
@@ -61,12 +67,23 @@ CAPABILITY_EXACT_MAP = {
     'Service Worker Registration': 'SERVICE_WORKER',
     'Web Worker Created': 'WORKER',
     'Blob URL Created': 'BLOB',
+    'Download Triggered': 'DOWNLOAD',
     'Object.defineProperty Called': 'HOOKING',
     'Eval Call': 'OBFUSCATION',
     'Function Constructor': 'OBFUSCATION',
     'atob De-obfuscation': 'OBFUSCATION',
     'String.fromCharCode De-obfuscation': 'OBFUSCATION',
-    'JSON.parse Suspicious Payload': 'OBFUSCATION'
+    'JSON.parse Suspicious Payload': 'OBFUSCATION',
+    'WebGL Context Creation': 'FINGERPRINTING',
+    'Canvas toDataURL': 'FINGERPRINTING',
+    'PushManager Subscribe': 'PUSH',
+    'Notification Request Permission': 'PUSH',
+    'Alert Dialog': 'SOCIAL_ENGINEERING',
+    'Confirm Dialog': 'SOCIAL_ENGINEERING',
+    'Prompt Dialog': 'SOCIAL_ENGINEERING',
+    'Fullscreen Requested': 'POPUP',
+    'Window Blur (Possible Popup)': 'POPUP',
+    'MutationObserver (Native)': 'DOM_MUTATION'
 }
 
 SUSPICIOUS_EVENTS = {
@@ -95,6 +112,9 @@ SUSPICIOUS_EVENTS = {
     'Web Worker Created',
     'Blob URL Created',
     'IFrame Src Set',
+    'IFrame Created (Potential Context Escape)',
+    'WARNING: Multiple IFrames Created',
+    'MutationObserver (Native)',
     'Sensitive Field Access',
     'Document Fragment Injection'
 }
@@ -175,6 +195,12 @@ WP_VERSION_PARAM_KEYS = (
 WP_PLUGIN_PATTERN = re.compile(r"/wp-content/plugins/([^/]+)/", re.IGNORECASE)
 WP_THEME_PATTERN = re.compile(r"/wp-content/themes/([^/]+)/", re.IGNORECASE)
 
+WEAK_ATTRIBUTE_PREFIXES = (
+    'weak_host=',
+    'weak_path=',
+    'weak_domain=',
+)
+
 
 class ScriptClusterer:
     """Cluster JavaScript scripts based on CDP event traces"""
@@ -248,6 +274,19 @@ class ScriptClusterer:
             host = host.split(':', 1)[0]
         return host
 
+    @staticmethod
+    def normalize_weak_host(host):
+        if not host:
+            return None
+        host = host.strip().lower().strip('.')
+        if not host:
+            return None
+        labels = [label for label in host.split('.') if label]
+        if len(labels) <= 1:
+            return host
+        normalized = ".".join(labels[:-1]).strip('.')
+        return normalized or host
+
     def categorize_url(self, url, script_domain=None):
         if not url:
             return None
@@ -265,9 +304,6 @@ class ScriptClusterer:
         if not domain:
             return 'domain:unknown'
 
-        suffix = domain.split('.')[-2:] if '.' in domain else [domain]
-        suffix_str = '.'.join(suffix)
-
         if any(domain.endswith(ad) for ad in AD_DOMAIN_SUFFIXES):
             return 'domain:ad'
         if any(domain.endswith(analytics) for analytics in ANALYTICS_DOMAIN_SUFFIXES):
@@ -275,7 +311,10 @@ class ScriptClusterer:
         if script_domain and domain == script_domain:
             return 'domain:script-origin'
 
-        return f"domain:{suffix_str}"
+        normalized_domain = self.normalize_weak_host(domain)
+        if normalized_domain:
+            return f"weak_domain={normalized_domain}"
+        return 'weak_domain=unknown'
 
     @staticmethod
     def extract_url_from_arg(arg):
@@ -396,6 +435,65 @@ class ScriptClusterer:
         return 2.0 if base in SUSPICIOUS_EVENTS else 1.0
 
     @staticmethod
+    def is_weak_attribute(part):
+        return any(part.startswith(prefix) for prefix in WEAK_ATTRIBUTE_PREFIXES)
+
+    @staticmethod
+    @lru_cache(maxsize=50000)
+    def decompose_token_components(token):
+        if not token:
+            return "", tuple(), tuple()
+        parts = token.split('|')
+        base = parts[0]
+        strong = []
+        weak = []
+        for part in parts[1:]:
+            if ScriptClusterer.is_weak_attribute(part):
+                weak.append(part)
+            else:
+                strong.append(part)
+        return base, tuple(strong), tuple(weak)
+
+    @staticmethod
+    def weak_attribute_penalty(weak_a, weak_b):
+        if not weak_a and not weak_b:
+            return 0.0
+        if weak_a == weak_b:
+            return 0.0
+        if not weak_a or not weak_b:
+            return 0.2
+        set_a = set(weak_a)
+        set_b = set(weak_b)
+        overlap = len(set_a & set_b)
+        union = len(set_a | set_b)
+        similarity = overlap / union if union else 1.0
+        base_cost = 0.05
+        variable_cost = (1.0 - similarity) * 0.15
+        return base_cost + variable_cost
+
+    @staticmethod
+    def canonicalize_token(token):
+        base, strong, _ = ScriptClusterer.decompose_token_components(token)
+        if not base and not strong:
+            return token
+        if strong:
+            return "|".join((base, *strong))
+        return base
+
+    @staticmethod
+    def has_weak_features(token):
+        _, _, weak = ScriptClusterer.decompose_token_components(token)
+        return bool(weak)
+
+    @staticmethod
+    def blend_embeddings(vec_a, vec_b, alpha=0.5):
+        blended = (1.0 - alpha) * vec_a + alpha * vec_b
+        norm = np.linalg.norm(blended)
+        if norm == 0:
+            return vec_a
+        return blended / norm
+
+    @staticmethod
     def extract_motifs(sequence, max_n=3):
         motifs = {}
         for n in range(2, max_n + 1):
@@ -452,10 +550,11 @@ class ScriptClusterer:
                 parts.append(bucket)
             host = self.extract_domain(url)
             if host:
-                parts.append(f"host={host}")
+                normalized_host = self.normalize_weak_host(host)
+                parts.append(f"weak_host={normalized_host or host}")
             path = self.short_path_from_url(url, max_len=60)
             if path:
-                parts.append(f"path={path}")
+                parts.append(f"weak_path={path}")
             worker_name = (arg.get('options') or {}).get('name') or arg.get('name')
             if worker_name:
                 parts.append(f"name={worker_name}")
@@ -466,10 +565,11 @@ class ScriptClusterer:
                 parts.append(bucket)
             host = self.extract_domain(url)
             if host:
-                parts.append(f"host={host}")
+                normalized_host = self.normalize_weak_host(host)
+                parts.append(f"weak_host={normalized_host or host}")
             path = self.short_path_from_url(url)
             if path:
-                parts.append(f"path={path}")
+                parts.append(f"weak_path={path}")
             method = (
                 arg.get('request', {}).get('method')
                 or arg.get('method')
@@ -488,6 +588,13 @@ class ScriptClusterer:
             initiator_type = arg.get('initiatorType')
             if initiator_type:
                 parts.append(f"initiator={initiator_type}")
+            if base_type == "Form Submitted":
+                field_count = arg.get('fieldCount')
+                if field_count is not None:
+                    parts.append(f"fields={field_count}")
+                preview = self.summarize_form_fields(arg.get('fields'))
+                if preview:
+                    parts.append(f"field_preview={preview}")
         elif base_type in {"Timeout (Function) Set", "Interval (Function) Set"}:
             delay = arg.get('delay')
             if delay is not None:
@@ -511,6 +618,90 @@ class ScriptClusterer:
             flags = self.extract_cookie_flags(cookie_value)
             if flags:
                 parts.append(f"flags={flags}")
+        elif base_type in {"Storage Event", "Cache API Open", "Cache API Match"}:
+            key = arg.get('key') or arg.get('cacheName')
+            if key:
+                parts.append(f"key={key}")
+            url = arg.get('url') or self.extract_url_from_arg(arg)
+            if url:
+                bucket = self.categorize_url(url, script_domain)
+                if bucket:
+                    parts.append(bucket)
+            value_summary = self.summarize_storage_value(arg.get('newValue') or arg.get('value'))
+            if value_summary:
+                parts.append(f"value_preview={value_summary}")
+        elif base_type in {"PushManager Subscribe", "Notification Request Permission"}:
+            options = arg.get('options') or {}
+            keys = sorted(list(options.keys()))
+            if keys:
+                parts.append(f"options={','.join(keys[:5])}")
+        elif base_type in {"WebGL Context Creation", "Canvas toDataURL"}:
+            context = arg.get('contextType') or arg.get('tagName')
+            if context:
+                parts.append(str(context))
+        elif base_type in {"Service Worker Registration"}:
+            script_url = arg.get('scriptURL') or self.extract_url_from_arg(arg)
+            bucket = self.categorize_url(script_url, script_domain)
+            if bucket:
+                parts.append(bucket)
+            host = self.extract_domain(script_url)
+            if host:
+                parts.append(f"weak_host={self.normalize_weak_host(host) or host}")
+            scope = (arg.get('options') or {}).get('scope')
+            if scope:
+                parts.append(f"scope={scope}")
+        elif base_type in {"Clipboard Read", "Clipboard Write"}:
+            length = arg.get('textLength')
+            if length is not None:
+                parts.append(f"len={length}")
+            preview = arg.get('textPreview')
+            if preview:
+                parts.append(f"preview={preview[:40]}")
+        elif base_type == "Hook Detection Attempt":
+            fname = arg.get('functionName')
+            if fname:
+                parts.append(f"function={fname}")
+        elif base_type in {"Blob URL Created", "Download Triggered"}:
+            size = arg.get('blobSize') or len(arg.get('href') or '')
+            if size:
+                parts.append(f"size={size}")
+            target = arg.get('href') or arg.get('blobType')
+            if target:
+                parts.append(f"target={target[:60]}")
+        elif base_type in {"Fullscreen Requested"}:
+            element = arg.get('element') or arg.get('elementId')
+            if element:
+                parts.append(str(element))
+        elif base_type in {"Alert Dialog", "Confirm Dialog", "Prompt Dialog"}:
+            message = arg.get('message') or ''
+            if message:
+                parts.append(f"msg={str(message)[:40]}")
+        elif base_type in {"Geolocation getCurrentPosition", "Geolocation watchPosition"}:
+            options = arg.get('options') or {}
+            accuracy = options.get('enableHighAccuracy')
+            if accuracy:
+                parts.append('high_accuracy')
+            timeout = options.get('timeout')
+            if timeout:
+                parts.append(f"timeout={timeout}")
+        elif base_type == "Window Blur (Possible Popup)":
+            timestamp = arg.get('timestamp')
+            if timestamp:
+                parts.append(str(timestamp))
+        elif base_type == "WARNING: Multiple IFrames Created":
+            count = arg.get('count')
+            if count is not None:
+                parts.append(f"count={count}")
+            message = arg.get('message')
+            if message:
+                parts.append(message[:40])
+        elif base_type == "MutationObserver (Native)":
+            mutation_type = arg.get('mutationType')
+            if mutation_type:
+                parts.append(mutation_type)
+            attribute = arg.get('attributeName')
+            if attribute:
+                parts.append(f"attr={attribute}")
         elif base_type == "IFrame Created (Potential Context Escape)":
             iframe_number = arg.get('iframeNumber')
             if iframe_number is not None:
@@ -635,6 +826,26 @@ class ScriptClusterer:
         return None
 
     @staticmethod
+    def summarize_form_fields(fields, max_fields=3):
+        if not isinstance(fields, list) or not fields:
+            return None
+        summaries = []
+        for field in fields[:max_fields]:
+            name = (field or {}).get('name') or ''
+            ftype = (field or {}).get('type') or ''
+            length = (field or {}).get('value_length')
+            parts = []
+            if name:
+                parts.append(name)
+            if ftype:
+                parts.append(ftype)
+            if length is not None:
+                parts.append(f"len={length}")
+            if parts:
+                summaries.append(":".join(parts))
+        return "|".join(summaries) if summaries else None
+
+    @staticmethod
     def short_path_from_url(url, max_len=40):
         if not url:
             return None
@@ -710,6 +921,12 @@ class ScriptClusterer:
         if token_a == token_b:
             return 0.0
 
+        base_a, strong_a, weak_a = ScriptClusterer.decompose_token_components(token_a)
+        base_b, strong_b, weak_b = ScriptClusterer.decompose_token_components(token_b)
+
+        if base_a == base_b and strong_a == strong_b:
+            return ScriptClusterer.weak_attribute_penalty(weak_a, weak_b)
+
         if token_embeddings:
             vec_a = token_embeddings.get(token_a)
             vec_b = token_embeddings.get(token_b)
@@ -732,6 +949,10 @@ class ScriptClusterer:
             return float(len(seq_b))
         if not seq_b:
             return float(len(seq_a))
+        if seq_a is seq_b:
+            return 0.0
+        if len(seq_a) == len(seq_b) and seq_a == seq_b:
+            return 0.0
 
         len_a = len(seq_a)
         len_b = len(seq_b)
@@ -1053,10 +1274,42 @@ class ScriptClusterer:
         # Fit encoder on compressed tokens for a tighter vocabulary
         if all_tokens:
             self.encoder.fit(all_tokens)
-            print(f"Vocabulary size: {len(self.encoder.classes_)}")
-            self.encoded_sequences = [
-                self.encoder.transform(seq).astype(float) for seq in self.sequences
-            ]
+            vocab_size = len(self.encoder.classes_)
+            print(f"Vocabulary size: {vocab_size}")
+
+            token_to_index = {token: idx for idx, token in enumerate(self.encoder.classes_)}
+            sequence_count = len(self.sequences)
+            use_parallel = sequence_count >= 500 and vocab_size >= 5000
+
+            if use_parallel:
+                try:
+                    worker_count = max(1, cpu_count() - 1)
+                except NotImplementedError:
+                    worker_count = 1
+                worker_count = min(worker_count, sequence_count)
+            else:
+                worker_count = 1
+
+            if worker_count == 1:
+                self.encoded_sequences = [
+                    np.array([float(token_to_index[token]) for token in seq], dtype=float)
+                    for seq in self.sequences
+                ]
+            else:
+                print(f"Encoding sequences with {worker_count} worker(s)...")
+                with Pool(
+                    processes=worker_count,
+                    initializer=_init_encoder_worker,
+                    initargs=(token_to_index,),
+                ) as pool:
+                    encoded = []
+                    for seq in tqdm(
+                        pool.imap(_encode_sequence_worker, self.sequences),
+                        total=sequence_count,
+                        desc="Encoding sequences",
+                    ):
+                        encoded.append(np.array(seq, dtype=float))
+                self.encoded_sequences = encoded
         else:
             print("No events found to encode.")
             self.encoded_sequences = []
@@ -1150,9 +1403,33 @@ class ScriptClusterer:
             self.semantic_cost_enabled = False
             return False
 
-        self.token_embeddings = normalized_embeddings
-        self.embedding_dim = next(iter(normalized_embeddings.values())).shape[0]
-        coverage = len(normalized_embeddings) / len(unique_tokens) * 100.0
+        canonical_vectors = defaultdict(list)
+        for token, vec in normalized_embeddings.items():
+            canonical_key = ScriptClusterer.canonicalize_token(token)
+            canonical_vectors[canonical_key].append(vec)
+
+        canonical_means = {}
+        for key, vectors in canonical_vectors.items():
+            stacked = np.stack(vectors)
+            mean_vec = stacked.mean(axis=0)
+            norm = np.linalg.norm(mean_vec)
+            if norm == 0:
+                continue
+            canonical_means[key] = mean_vec / norm
+
+        adjusted_embeddings = {}
+        for token, vec in normalized_embeddings.items():
+            if ScriptClusterer.has_weak_features(token):
+                canonical_key = ScriptClusterer.canonicalize_token(token)
+                canonical_vec = canonical_means.get(canonical_key)
+                if canonical_vec is not None:
+                    adjusted_embeddings[token] = ScriptClusterer.blend_embeddings(vec, canonical_vec, alpha=0.5)
+                    continue
+            adjusted_embeddings[token] = vec
+
+        self.token_embeddings = adjusted_embeddings
+        self.embedding_dim = next(iter(adjusted_embeddings.values())).shape[0]
+        coverage = len(adjusted_embeddings) / len(unique_tokens) * 100.0
         self.semantic_cost_enabled = True
 
         print(f"Embedding model trained (dim={self.embedding_dim}, coverage={coverage:.1f}% of tokens).")
@@ -1638,6 +1915,21 @@ def _dtw_worker(pairs):
             dist = max_distance
         results.append((i, j, dist))
     return results
+
+
+_ENCODER_WORKER_CONTEXT = {}
+
+
+def _init_encoder_worker(token_map):
+    """Initializer for sequence encoding workers."""
+    global _ENCODER_WORKER_CONTEXT
+    _ENCODER_WORKER_CONTEXT = {'token_map': token_map}
+
+
+def _encode_sequence_worker(sequence):
+    """Encode a token sequence using the shared token map."""
+    token_map = _ENCODER_WORKER_CONTEXT['token_map']
+    return [float(token_map[token]) for token in sequence]
 
 
 def main():

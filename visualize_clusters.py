@@ -110,8 +110,10 @@ class ClusterVisualizer:
         print(f"Loaded {len(self.traces)} traces with {len(self.event_types)} event types")
 
         # Compute 3D embeddings for scatter plot
-        self.embeddings = None
-        self.embedding_method = None
+        cached_embeddings = results.get('tsne_embeddings')
+        self.tsne_meta = results.get('tsne_metadata') or {}
+        self.embeddings = np.array(cached_embeddings, dtype=np.float32) if cached_embeddings is not None else None
+        self.embedding_method = self.tsne_meta.get('method')
         self.compute_embeddings()
 
         # Create DataFrame for easier manipulation
@@ -139,6 +141,12 @@ class ClusterVisualizer:
 
     def compute_embeddings(self):
         """Compute 3D embeddings for visualization (t-SNE only, with fallback)."""
+        if self.embeddings is not None:
+            method = self.embedding_method or "cached"
+            print(f"Using cached 3D embeddings ({method}).")
+            self._spread_overlapping_points()
+            return
+
         print("Computing 3D embeddings...")
         n_components = 3
         n_samples = len(self.traces)
@@ -168,7 +176,30 @@ class ClusterVisualizer:
             method = "Force Layout"
 
         self.embedding_method = method
+        self._spread_overlapping_points()
         print(f"Embeddings ({method}) shape: {self.embeddings.shape}")
+
+    def _spread_overlapping_points(self, jitter_scale=1e-3):
+        """Add slight jitter to identical coordinates so clustered points are visible."""
+        if self.embeddings is None or len(self.embeddings) == 0:
+            return
+        coords = self.embeddings
+        rounded = defaultdict(list)
+        for idx, point in enumerate(coords):
+            key = tuple(np.round(point, 6))
+            rounded[key].append(idx)
+
+        if all(len(indices) == 1 for indices in rounded.values()):
+            return
+
+        rng = np.random.default_rng(42)
+        scale = max(np.ptp(coords, axis=0).max(), 1.0) * jitter_scale
+        for indices in rounded.values():
+            if len(indices) <= 1:
+                continue
+            for idx in indices:
+                jitter = rng.normal(scale=scale, size=coords.shape[1])
+                coords[idx] += jitter
 
     def create_dataframe(self):
         """Create DataFrame with all trace information"""

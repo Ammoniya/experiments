@@ -5,6 +5,15 @@ set -e
 
 DEFAULT_OUTPUT="clustering_results.pkl"
 
+# Ensure joblib has a writable temp directory (shared memory is not available here)
+if [ -z "${JOBLIB_TEMP_FOLDER:-}" ]; then
+    JOBLIB_TEMP_FOLDER="$PWD/.joblib_tmp"
+fi
+if [ ! -d "$JOBLIB_TEMP_FOLDER" ]; then
+    mkdir -p "$JOBLIB_TEMP_FOLDER"
+fi
+export JOBLIB_TEMP_FOLDER
+
 show_help() {
     cat <<'EOF'
 Usage: ./run_clustering.sh [OPTIONS] [MAX_SCRIPTS] [MIN_CLUSTER_SIZE]
@@ -16,6 +25,7 @@ Options:
 
 Environment:
   USE_CACHE=1          Equivalent to providing --use-cache.
+  JOBLIB_TEMP_FOLDER   Writable directory for joblib's temp storage (defaults to .joblib_tmp).
 
 Examples:
   ./run_clustering.sh 250 10
@@ -86,10 +96,11 @@ if [ "$USE_CACHE" -eq 1 ]; then
 else
     echo "  Cache mode: disabled"
 fi
+echo "  JOBLIB_TEMP_FOLDER: $JOBLIB_TEMP_FOLDER"
 echo ""
 
 # Step 1: Check dependencies
-echo "[1/6] Checking dependencies..."
+echo "[1/7] Checking dependencies..."
 python3 << 'EOF'
 import importlib.util as ilu
 import sys
@@ -146,17 +157,17 @@ fi
 echo ""
 if [ "$USE_CACHE" -eq 1 ]; then
     if [ -f "$OUTPUT" ]; then
-        echo "[2/6] Reusing cached clustering results..."
+        echo "[2/7] Reusing cached clustering results..."
         echo "  Cache file: $OUTPUT"
     else
-        echo "[2/6] Cache requested but $OUTPUT was not found."
+        echo "[2/7] Cache requested but $OUTPUT was not found."
         echo "       Falling back to full clustering run..."
         USE_CACHE=0
     fi
 fi
 
 if [ "$USE_CACHE" -eq 0 ]; then
-    echo "[2/6] Running clustering pipeline..."
+    echo "[2/7] Running clustering pipeline..."
     echo "  Data directory: $DATA_DIR"
     echo "  Max scripts: $MAX_SCRIPTS"
     echo "  Min cluster size: $MIN_CLUSTER_SIZE"
@@ -178,7 +189,7 @@ fi
 
 # Step 3: Verify output
 echo ""
-echo "[3/6] Verifying output..."
+echo "[3/7] Verifying output..."
 if [ -f "$OUTPUT" ]; then
     echo "✓ Results saved to: $OUTPUT"
     SIZE=$(du -h "$OUTPUT" | cut -f1)
@@ -188,18 +199,27 @@ else
     exit 1
 fi
 
-# Step 4: Precompute subsequence alignments
+# Step 4: Compute and cache t-SNE embeddings
 echo ""
-echo "[4/6] Precomputing subsequence alignment cache..."
+echo "[4/7] Computing t-SNE embeddings..."
+if python3 compute_tsne_embeddings.py --results "$OUTPUT" --force; then
+    echo "✓ t-SNE embeddings cached."
+else
+    echo "⚠ Failed to compute t-SNE embeddings. Visualization will recompute them on demand."
+fi
+
+# Step 5: Precompute subsequence alignments
+echo ""
+echo "[5/7] Precomputing subsequence alignment cache..."
 if python3 precompute_subsequence_alignments.py --results "$OUTPUT"; then
     echo "✓ Subsequence DTW cache ready."
 else
     echo "⚠ Failed to build subsequence alignment cache. Visualization will fall back to error messages."
 fi
 
-# Step 5: Generate text report
+# Step 6: Generate text report
 echo ""
-echo "[5/6] Generating cluster report..."
+echo "[6/7] Generating cluster report..."
 REPORT_FILE="cluster_report.txt"
 python3 generate_cluster_report.py --results "$OUTPUT" --data-dir "$DATA_DIR" > "$REPORT_FILE"
 if [ $? -ne 0 ]; then
@@ -208,9 +228,9 @@ if [ $? -ne 0 ]; then
 fi
 echo "✓ Cluster report saved to: $REPORT_FILE"
 
-# Step 6: Launch visualization
+# Step 7: Launch visualization
 echo ""
-echo "[6/6] Launching interactive visualization..."
+echo "[7/7] Launching interactive visualization..."
 echo ""
 
 VIZ_ARGS=()
