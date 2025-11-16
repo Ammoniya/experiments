@@ -131,12 +131,12 @@ class ClusterVisualizer:
         self.subsequence_cache, self.subsequence_cache_meta = load_alignment_cache(self.alignment_cache_path)
         if not self.subsequence_cache:
             print(
-                f"⚠ No subsequence alignment cache found at {self.alignment_cache_path}. "
+                f"[WARN] No subsequence alignment cache found at {self.alignment_cache_path}. "
                 "Run precompute_subsequence_alignments.py to cache DTW metadata."
             )
         elif cache_is_stale(self.subsequence_cache_meta, self.results_file):
             print(
-                f"⚠ Alignment cache at {self.alignment_cache_path} may be stale relative to {self.results_file}."
+                f"[WARN] Alignment cache at {self.alignment_cache_path} may be stale relative to {self.results_file}."
             )
 
     def compute_embeddings(self):
@@ -632,7 +632,7 @@ class ClusterVisualizer:
                 axis=1
             )
 
-            axis_base = self.embedding_method or "t-SNE"
+            axis_labels = ("TSNE-1", "TSNE-2", "TSNE-3")
 
             if color_by == 'cluster':
                 fig = go.Figure()
@@ -657,7 +657,7 @@ class ClusterVisualizer:
                     )
 
                 fig.update_layout(
-                    title=f'Script Clusters (n={len(df)})',
+                    title=None,
                     legend=dict(
                         title='Clusters',
                         bgcolor='rgba(255,255,255,0.7)',
@@ -708,9 +708,9 @@ class ClusterVisualizer:
 
             fig.update_layout(
                 scene=dict(
-                    xaxis=dict(title=f"{axis_base} 1", gridcolor='lightgray', backgroundcolor='rgba(0,0,0,0)'),
-                    yaxis=dict(title=f"{axis_base} 2", gridcolor='lightgray', backgroundcolor='rgba(0,0,0,0)'),
-                    zaxis=dict(title=f"{axis_base} 3", gridcolor='lightgray', backgroundcolor='rgba(0,0,0,0)')
+                    xaxis=dict(title=axis_labels[0], gridcolor='lightgray', backgroundcolor='rgba(0,0,0,0)'),
+                    yaxis=dict(title=axis_labels[1], gridcolor='lightgray', backgroundcolor='rgba(0,0,0,0)'),
+                    zaxis=dict(title=axis_labels[2], gridcolor='lightgray', backgroundcolor='rgba(0,0,0,0)')
                 ),
                 margin=dict(l=0, r=0, b=0, t=60)
             )

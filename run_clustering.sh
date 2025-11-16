@@ -125,25 +125,25 @@ for module_name, pip_name in required:
         missing.append(pip_name)
 
 if has_module("dtaidistance"):
-    print("✓ dtaidistance (fast DTW)")
+    print("[OK] dtaidistance (fast DTW)")
 else:
-    print("⚠ dtaidistance not found, will use fastdtw (slower)")
+    print("[WARN] dtaidistance not found, will use fastdtw (slower)")
     if has_module("fastdtw"):
-        print("✓ fastdtw (fallback)")
+        print("[OK] fastdtw (fallback)")
     else:
         missing.append("dtaidistance OR fastdtw")
 
 if has_module("umap"):
-    print("✓ umap-learn (recommended)")
+    print("[OK] umap-learn (recommended)")
 else:
-    print("⚠ umap-learn not found, will use t-SNE (slower)")
+    print("[WARN] umap-learn not found, will use t-SNE (slower)")
 
 if missing:
-    print(f"\n❌ Missing dependencies: {', '.join(missing)}")
+    print(f"\n Missing dependencies: {', '.join(missing)}")
     print("Install with: pip install -r requirements.txt")
     sys.exit(1)
 else:
-    print("\n✓ All required dependencies installed")
+    print("\n[OK] All required dependencies installed")
 EOF
 
 if [ $? -ne 0 ]; then
@@ -180,7 +180,7 @@ if [ "$USE_CACHE" -eq 0 ]; then
         --output "$OUTPUT"
 
     if [ $? -ne 0 ]; then
-        echo "❌ Clustering failed!"
+        echo "Clustering failed!"
         exit 1
     fi
 else
@@ -191,11 +191,11 @@ fi
 echo ""
 echo "[3/7] Verifying output..."
 if [ -f "$OUTPUT" ]; then
-    echo "✓ Results saved to: $OUTPUT"
+    echo "[OK] Results saved to: $OUTPUT"
     SIZE=$(du -h "$OUTPUT" | cut -f1)
     echo "  File size: $SIZE"
 else
-    echo "❌ Output file not found!"
+    echo "Output file not found!"
     exit 1
 fi
 
@@ -203,30 +203,33 @@ fi
 echo ""
 echo "[4/7] Computing t-SNE embeddings..."
 if python3 compute_tsne_embeddings.py --results "$OUTPUT" --force; then
-    echo "✓ t-SNE embeddings cached."
+    echo "[OK] t-SNE embeddings cached."
 else
-    echo "⚠ Failed to compute t-SNE embeddings. Visualization will recompute them on demand."
+    echo "[WARN] Failed to compute t-SNE embeddings. Visualization will recompute them on demand."
 fi
 
 # Step 5: Precompute subsequence alignments
 echo ""
 echo "[5/7] Precomputing subsequence alignment cache..."
 if python3 precompute_subsequence_alignments.py --results "$OUTPUT"; then
-    echo "✓ Subsequence DTW cache ready."
+    echo "[OK] Subsequence DTW cache ready."
 else
-    echo "⚠ Failed to build subsequence alignment cache. Visualization will fall back to error messages."
+    echo "Failed to build subsequence alignment cache. Visualization will fall back to error messages."
 fi
 
 # Step 6: Generate text report
 echo ""
 echo "[6/7] Generating cluster report..."
 REPORT_FILE="cluster_report.txt"
-python3 generate_cluster_report.py --results "$OUTPUT" --data-dir "$DATA_DIR" > "$REPORT_FILE"
+python3 generate_cluster_report.py \
+    --results "$OUTPUT" \
+    --data-dir "$DATA_DIR" \
+    --output "$REPORT_FILE"
 if [ $? -ne 0 ]; then
-    echo "❌ Failed to generate cluster report!"
+    echo "Failed to generate cluster report!"
     exit 1
 fi
-echo "✓ Cluster report saved to: $REPORT_FILE"
+echo "[OK] Cluster report saved to: $REPORT_FILE"
 
 # Step 7: Launch visualization
 echo ""

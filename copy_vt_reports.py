@@ -91,8 +91,8 @@ def process_experiment_data():
 
                 if vt_report_path:
                     shutil.copy2(vt_report_path, dest_path)
-                    print(f"  ✓ Copied VT report from: {vt_report_path.name}")
-                    print(f"  ✓ To: {dest_path}")
+                    print(f"  [OK] Copied VT report from: {vt_report_path.name}")
+                    print(f"  [OK] To: {dest_path}")
                     stats["matched"] += 1
                 else:
                     print(f"  ✗ No matching VT report found")

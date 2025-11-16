@@ -122,7 +122,7 @@ class AlignmentCacheBuilder:
                 "Subsequence alignment requires dtaidistance>=2.3.0. "
                 "Install it and rerun precompute_subsequence_alignments.py."
             )
-            print("⚠ dtaidistance not available - caching informative errors instead.")
+            print("[WARN] dtaidistance not available - caching informative errors instead.")
 
         for trace in tqdm(self.traces, desc="Computing DTW cache"):
             trace_id = trace.get("trace_id")
@@ -310,7 +310,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         pickle.dump(payload, fh)
 
     print("")
-    print(f"✓ Cached {len(alignments)} trace alignments to {output_path}")
+    print(f"[OK] Cached {len(alignments)} trace alignments to {output_path}")
     error_count = metadata.get("cached_errors", 0)
     if error_count:
         print(f"  ↳ {error_count} entries contain errors (see cache for details).")

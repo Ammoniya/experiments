@@ -11,6 +11,7 @@ import json
 import math
 import pickle
 from collections import Counter, defaultdict
+from contextlib import redirect_stdout
 from pathlib import Path
 from typing import Dict, List, Tuple, Any
 
@@ -346,7 +347,7 @@ def generate_report(results_path: Path, data_dir: Path) -> None:
     if cached_alignments:
         alignment_cache.update(cached_alignments)
         if cache_is_stale(cache_meta, results_path):
-            print(f"⚠ Alignment cache at {cache_path} appears stale; recomputing entries on demand.")
+            print(f"[WARN] Alignment cache at {cache_path} appears stale; recomputing entries on demand.")
         else:
             print(f"Loaded subsequence alignment cache from {cache_path}")
     trace_index_lookup = {trace.get("trace_id"): idx for idx, trace in enumerate(traces)}
@@ -454,6 +455,8 @@ def main():
                         help="Path to clustering results pickle file")
     parser.add_argument("--data-dir", default="experiment_data",
                         help="Experiment data directory (for script paths)")
+    parser.add_argument("--output",
+                        help="Optional path to write the report instead of stdout")
     args = parser.parse_args()
 
     results_path = Path(args.results).resolve()
@@ -464,7 +467,13 @@ def main():
     if not data_dir.exists():
         raise SystemExit(f"Data directory not found: {data_dir}")
 
-    generate_report(results_path, data_dir)
+    output_path = Path(args.output).resolve() if args.output else None
+    if output_path:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        with output_path.open("w", encoding="utf-8") as fh, redirect_stdout(fh):
+            generate_report(results_path, data_dir)
+    else:
+        generate_report(results_path, data_dir)
 
 
 if __name__ == "__main__":

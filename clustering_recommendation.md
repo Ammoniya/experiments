@@ -63,7 +63,7 @@ experiment_data/
 
 ## Recommended Clustering Algorithms for Temporal Behavior
 
-### 1. **Dynamic Time Warping (DTW) + HDBSCAN** ⭐ CURRENT DEFAULT
+### 1. **Dynamic Time Warping (DTW) + HDBSCAN** (CURRENT DEFAULT)
 
 **Why this works best:**
 - **Preserves temporal order**: DTW aligns sequences of different lengths while respecting event order
@@ -344,11 +344,11 @@ def create_feature_vector(sequence):
 
 **DTW + Hierarchical Clustering** because:
 
-1. ✅ You have temporal event sequences (order matters)
-2. ✅ Scripts have variable lengths (DTW handles this)
-3. ✅ You want to discover behavioral groups (ads, analytics, tracking, etc.)
-4. ✅ Interpretability is important (dendrogram shows relationships)
-5. ✅ Dataset size seems moderate (< 10,000 scripts per run)
+1. [OK] You have temporal event sequences (order matters)
+2. [OK] Scripts have variable lengths (DTW handles this)
+3. [OK] You want to discover behavioral groups (ads, analytics, tracking, etc.)
+4. [OK] Interpretability is important (dendrogram shows relationships)
+5. [OK] Dataset size seems moderate (< 10,000 scripts per run)
 
 ### Quick Start Code
 
