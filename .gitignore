@@ -14,4 +14,4 @@ virustotal_reports/
 .idea/
 clustering_results_traces.json
 cluster_report.txt
- samples_to_check/
+samples_to_check/
