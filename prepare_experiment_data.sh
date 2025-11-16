@@ -11,6 +11,7 @@ STEPS=(
     "copy_vt_reports.py"
     "process_traces.py"
     "analyze_traces.py"
+    "compute_ast_fingerprints.py"
 )
 
 echo "========================================"
