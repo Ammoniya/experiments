@@ -550,7 +550,7 @@ class ClusterVisualizer:
         colors = px.colors.qualitative.Plotly + px.colors.qualitative.Set2 + px.colors.qualitative.Dark24
 
         app.layout = html.Div([
-            html.H1("JavaScript Script Clustering - Interactive Visualization",
+            html.H1("CompWeb - JavaScript Script Clustering - Interactive Visualization",
                     style={'textAlign': 'center', 'marginBottom': 20}),
 
             html.Div([
