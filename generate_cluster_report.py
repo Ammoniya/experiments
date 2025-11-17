@@ -13,7 +13,9 @@ import pickle
 from collections import Counter, defaultdict
 from contextlib import redirect_stdout
 from pathlib import Path
-from typing import Dict, List, Tuple, Any
+from typing import Any, Dict, List, Tuple
+
+from cluster_neighbors import compute_cluster_neighbors, normalize_neighbor_mapping
 
 from subsequence_alignment_cache import (
     cache_is_stale,
@@ -335,6 +337,7 @@ def format_alignment_lines(alignment: Dict[str, Any]) -> List[str]:
 def generate_report(results_path: Path, data_dir: Path) -> None:
     results = load_results(results_path)
     traces: List[Dict[str, Any]] = results["traces"]
+    distance_matrix = results.get("distance_matrix")
     raw_sequences: List[List[str]] = results.get("sequences") or [
         trace.get("event_sequence", []) for trace in traces
     ]
@@ -361,6 +364,10 @@ def generate_report(results_path: Path, data_dir: Path) -> None:
     for trace in traces:
         cluster_id = int(trace.get("cluster", -1))
         clusters[cluster_id].append(trace)
+
+    cluster_neighbors = normalize_neighbor_mapping(cluster_metadata.get("cluster_neighbors"))
+    if not cluster_neighbors:
+        cluster_neighbors = compute_cluster_neighbors(distance_matrix, traces, limit=5)
 
     if overall_silhouette is not None:
         print(f"Overall silhouette (avg similarity across clusters): {overall_silhouette:.3f}\n")
@@ -392,6 +399,26 @@ def generate_report(results_path: Path, data_dir: Path) -> None:
             print(f"AST average similarity: n/a ({ast_scripts}/{len(members)} scripts with AST)\n")
         else:
             print("AST average similarity: n/a (no AST fingerprints)\n")
+
+        neighbor_entries = cluster_neighbors.get(cluster_id) or []
+        if neighbor_entries:
+            formatted_neighbors = []
+            for entry in neighbor_entries:
+                if isinstance(entry, dict):
+                    other = entry.get("cluster_id")
+                    distance = entry.get("distance")
+                else:
+                    other, distance = entry
+                try:
+                    other_label = int(other)
+                    distance_val = float(distance)
+                except (TypeError, ValueError):
+                    continue
+                formatted_neighbors.append(f"{other_label} ({distance_val:.3f})")
+            neighbor_str = ", ".join(formatted_neighbors) if formatted_neighbors else "n/a"
+        else:
+            neighbor_str = "n/a"
+        print(f"Closest clusters: {neighbor_str}\n")
 
         print(format_counter(plugin_counts, "Cluster WordPress Plugins"))
         print(format_counter(theme_counts, "Cluster WordPress Themes"))

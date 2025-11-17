@@ -29,6 +29,8 @@ from multiprocessing import Pool, cpu_count
 import pickle
 from tqdm import tqdm
 
+from cluster_neighbors import compute_cluster_neighbors
+
 CAPABILITY_EXACT_MAP = {
     'XHR Request': 'NET_XHR',
     'XHR Response': 'NET_XHR',
@@ -1679,6 +1681,16 @@ class ScriptClusterer:
                 label = f"{value:.3f}" if value is not None else "n/a"
                 print(f"  Cluster {cluster_id}: {label}")
 
+        neighbor_summary = self.compute_cluster_neighbor_summary(limit=5)
+        if neighbor_summary:
+            print("\nNearest cluster distances:")
+            for cluster_id in sorted(neighbor_summary):
+                entries = neighbor_summary[cluster_id]
+                preview = ", ".join(
+                    f"{item['cluster_id']}={item['distance']:.3f}" for item in entries[:5]
+                ) or "n/a"
+                print(f"  Cluster {cluster_id}: {preview}")
+
         return self.clusters
 
     def compute_silhouette_scores(self):
@@ -1777,6 +1789,16 @@ class ScriptClusterer:
             self.cluster_metadata['ast_counts'] = ast_counts
 
         return ast_similarity
+
+    def compute_cluster_neighbor_summary(self, limit=5):
+        """Compute and cache nearest cluster IDs for each cluster."""
+        if self.distance_matrix is None or self.clusters is None:
+            return {}
+
+        neighbors = compute_cluster_neighbors(self.distance_matrix, self.traces, limit=limit)
+        if neighbors:
+            self.cluster_metadata['cluster_neighbors'] = neighbors
+        return neighbors
 
     def analyze_clusters(self):
         """Analyze cluster characteristics"""

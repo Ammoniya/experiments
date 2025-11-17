@@ -80,6 +80,8 @@ import plotly.express as px
 import plotly.graph_objects as go
 from sklearn.manifold import TSNE
 
+from cluster_neighbors import compute_cluster_neighbors, normalize_neighbor_mapping
+
 
 class ClusterVisualizer:
     """Interactive visualization for clustering results"""
@@ -123,6 +125,7 @@ class ClusterVisualizer:
         for idx, trace in enumerate(self.traces):
             trace['_index'] = idx
             self.trace_lookup[trace['trace_id']] = idx
+        self.cluster_neighbor_lookup = self._load_cluster_neighbors()
 
         self.event_type_to_int = {label: idx for idx, label in enumerate(self.event_types)}
         self.numeric_sequences = self._encode_sequences(self.sequences)
@@ -275,6 +278,25 @@ class ClusterVisualizer:
                     'num_events': trace.get('num_events'),
                 }
         return representatives
+
+    def _load_cluster_neighbors(self):
+        """Load neighbor metadata from cache or compute it on demand."""
+        stored = normalize_neighbor_mapping(self.cluster_metadata.get('cluster_neighbors'))
+        if stored:
+            return stored
+        computed = compute_cluster_neighbors(self.distance_matrix, self.traces, limit=None)
+        if computed:
+            self.cluster_metadata['cluster_neighbors'] = computed
+        return computed
+
+    def get_cluster_neighbors(self, cluster_id, limit=5):
+        """Return the closest clusters (with distances) for a cluster id."""
+        if cluster_id in (None, -1):
+            return []
+        neighbors = self.cluster_neighbor_lookup.get(cluster_id) or []
+        if limit is None:
+            return neighbors
+        return neighbors[:limit]
 
     def _build_ast_display_cache(self):
         """Prepare lightweight AST summaries so click callbacks stay fast."""
@@ -790,6 +812,13 @@ class ClusterVisualizer:
             wp_plugins = trace.get('wordpress_plugins') or []
             wp_themes = trace.get('wordpress_themes') or []
             cluster_plugin_counts, cluster_theme_counts = self.get_cluster_wp_distribution(trace.get('cluster'))
+            nearest_clusters = self.get_cluster_neighbors(trace.get('cluster'), limit=5)
+            if nearest_clusters:
+                nearest_clusters_display = ', '.join(
+                    f"#{item['cluster_id']} ({item['distance']:.3f})" for item in nearest_clusters
+                )
+            else:
+                nearest_clusters_display = 'n/a'
 
             def render_wp_items(items, empty_text):
                 grouped = defaultdict(Counter)
@@ -840,6 +869,10 @@ class ClusterVisualizer:
                             html.Tr([html.Td(html.Strong("Trace ID:")), html.Td(trace['trace_id'])]),
                             html.Tr([html.Td(html.Strong("Script ID:")), html.Td(trace['script_id'])]),
                             html.Tr([html.Td(html.Strong("Cluster:")), html.Td(trace['cluster'], style={'color': 'blue', 'fontWeight': 'bold'})]),
+                            html.Tr([
+                                html.Td(html.Strong("Nearest Clusters:")),
+                                html.Td(nearest_clusters_display, style={'fontFamily': 'monospace'})
+                            ]),
                             html.Tr([
                                 html.Td(html.Strong("Cluster Avg Similarity:")),
                                 html.Td(format_metric(cluster_similarity))

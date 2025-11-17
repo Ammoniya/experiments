@@ -25,6 +25,7 @@ Options:
 
 Environment:
   USE_CACHE=1          Equivalent to providing --use-cache.
+  TSNE_FORCE=1         Recompute t-SNE embeddings even if cached ones exist.
   JOBLIB_TEMP_FOLDER   Writable directory for joblib's temp storage (defaults to .joblib_tmp).
 
 Examples:
@@ -202,7 +203,11 @@ fi
 # Step 4: Compute and cache t-SNE embeddings
 echo ""
 echo "[4/7] Computing t-SNE embeddings..."
-if python3 compute_tsne_embeddings.py --results "$OUTPUT" --force; then
+TSNE_ARGS=(--results "$OUTPUT")
+if [ "${TSNE_FORCE:-0}" -eq 1 ]; then
+    TSNE_ARGS+=(--force)
+fi
+if python3 compute_tsne_embeddings.py "${TSNE_ARGS[@]}"; then
     echo "[OK] t-SNE embeddings cached."
 else
     echo "[WARN] Failed to compute t-SNE embeddings. Visualization will recompute them on demand."
