@@ -4,6 +4,8 @@
 set -e
 
 DEFAULT_OUTPUT="clustering_results.pkl"
+DEFAULT_DTW_MAX_DISTANCE="${DEFAULT_DTW_MAX_DISTANCE:-200}"
+DEFAULT_DTW_LB_RATIO="${DEFAULT_DTW_LB_RATIO:-0.05}"
 
 # Ensure joblib has a writable temp directory (shared memory is not available here)
 if [ -z "${JOBLIB_TEMP_FOLDER:-}" ]; then
@@ -21,10 +23,17 @@ Usage: ./run_clustering.sh [OPTIONS] [MAX_SCRIPTS] [MIN_CLUSTER_SIZE]
 Options:
   --use-cache          Skip recomputing clusters and reuse the last results file.
   --no-cache           Force recomputing clusters even if a cache file exists.
+  --dtw-max-distance   Cap DTW distances (enables LB_Keogh pruning in cluster_scripts.py).
+  --dtw-lb-ratio       Override the LB_Keogh window ratio passed to cluster_scripts.py.
+  --disable-dtw-pruning
+                        Skip DTW lower-bound pruning (restores legacy behavior).
   -h, --help           Show this help message and exit.
 
 Environment:
   USE_CACHE=1          Equivalent to providing --use-cache.
+  DTW_MAX_DISTANCE     Default value for --dtw-max-distance.
+  DTW_LB_RATIO         Default value for --dtw-lb-ratio.
+  DTW_PRUNING_ENABLED  Set to 0 to disable pruning without editing the script.
   TSNE_FORCE=1         Recompute t-SNE embeddings even if cached ones exist.
   JOBLIB_TEMP_FOLDER   Writable directory for joblib's temp storage (defaults to .joblib_tmp).
 
@@ -35,6 +44,9 @@ EOF
 }
 
 USE_CACHE="${USE_CACHE:-0}"
+DTW_PRUNING_ENABLED="${DTW_PRUNING_ENABLED:-1}"
+DTW_MAX_DISTANCE="${DTW_MAX_DISTANCE:-$DEFAULT_DTW_MAX_DISTANCE}"
+DTW_LB_RATIO="${DTW_LB_RATIO:-$DEFAULT_DTW_LB_RATIO}"
 POSITIONAL_ARGS=()
 
 while [[ $# -gt 0 ]]; do
@@ -45,6 +57,26 @@ while [[ $# -gt 0 ]]; do
             ;;
         --no-cache)
             USE_CACHE=0
+            shift
+            ;;
+        --dtw-max-distance)
+            if [ -z "${2:-}" ]; then
+                echo "--dtw-max-distance requires a numeric value"
+                exit 1
+            fi
+            DTW_MAX_DISTANCE="$2"
+            shift 2
+            ;;
+        --dtw-lb-ratio)
+            if [ -z "${2:-}" ]; then
+                echo "--dtw-lb-ratio requires a numeric value"
+                exit 1
+            fi
+            DTW_LB_RATIO="$2"
+            shift 2
+            ;;
+        --disable-dtw-pruning)
+            DTW_PRUNING_ENABLED=0
             shift
             ;;
         -h|--help)
@@ -92,6 +124,12 @@ echo "Configuration:"
 echo "  Data directory: $DATA_DIR"
 echo "  Max scripts: $MAX_SCRIPTS"
 echo "  Min cluster size: $MIN_CLUSTER_SIZE"
+if [ "$DTW_PRUNING_ENABLED" -eq 1 ]; then
+    echo "  DTW max distance: $DTW_MAX_DISTANCE"
+    echo "  DTW LB ratio: $DTW_LB_RATIO"
+else
+    echo "  DTW pruning: disabled"
+fi
 if [ "$USE_CACHE" -eq 1 ]; then
     echo "  Cache mode: enabled (expecting $OUTPUT)"
 else
@@ -174,11 +212,17 @@ if [ "$USE_CACHE" -eq 0 ]; then
     echo "  Min cluster size: $MIN_CLUSTER_SIZE"
     echo ""
 
+    DTW_ARGS=()
+    if [ "$DTW_PRUNING_ENABLED" -eq 1 ]; then
+        DTW_ARGS+=(--dtw-max-distance "$DTW_MAX_DISTANCE" --dtw-lb-ratio "$DTW_LB_RATIO")
+    fi
+
     python3 cluster_scripts.py \
         --data-dir "$DATA_DIR" \
         --max-scripts "$MAX_SCRIPTS" \
         --min-cluster-size "$MIN_CLUSTER_SIZE" \
-        --output "$OUTPUT"
+        --output "$OUTPUT" \
+        "${DTW_ARGS[@]}"
 
     if [ $? -ne 0 ]; then
         echo "Clustering failed!"

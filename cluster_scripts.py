@@ -978,6 +978,59 @@ class ScriptClusterer:
 
         return prev[len_b]
 
+    @staticmethod
+    def lb_keogh(sequence_a, sequence_b, radius):
+        """Compute the LB_Keogh lower bound between two encoded sequences."""
+        if radius <= 0:
+            radius = 0
+
+        if len(sequence_a) == 0:
+            return 0.0
+        if len(sequence_b) == 0:
+            return float(len(sequence_a))
+
+        seq_a = np.asarray(sequence_a, dtype=float)
+        seq_b = np.asarray(sequence_b, dtype=float)
+        len_b = len(seq_b)
+        total = 0.0
+
+        for idx, value in enumerate(seq_a):
+            if len_b == 0:
+                total += value * value
+                continue
+
+            start = max(0, idx - radius)
+            if start >= len_b:
+                diff = value - seq_b[-1]
+                total += diff * diff
+                continue
+
+            end = min(len_b, idx + radius + 1)
+            if end <= start:
+                segment = seq_b[start:start + 1]
+            else:
+                segment = seq_b[start:end]
+
+            lower = float(np.min(segment))
+            upper = float(np.max(segment))
+
+            if value > upper:
+                total += (value - upper) ** 2
+            elif value < lower:
+                total += (lower - value) ** 2
+
+        return math.sqrt(total)
+
+    @staticmethod
+    def lb_improved(sequence_a, sequence_b, radius):
+        """Return a symmetric lower bound based on LB_Keogh."""
+        if radius <= 0:
+            return 0.0
+        return max(
+            ScriptClusterer.lb_keogh(sequence_a, sequence_b, radius),
+            ScriptClusterer.lb_keogh(sequence_b, sequence_a, radius)
+        )
+
     def load_script_metadata(self, url_hash, timestamp):
         """Load script metadata from loaded_js/index.csv"""
         csv_path = self.experiment_data_dir / url_hash / timestamp / 'loaded_js' / 'index.csv'
@@ -1532,7 +1585,8 @@ class ScriptClusterer:
         for cluster_id in sorted(counts):
             print(f"  Capability Cluster {cluster_id}: {counts[cluster_id]} scripts")
 
-    def compute_dtw_distances(self, max_distance=None, num_workers=None, chunk_size=500):
+    def compute_dtw_distances(self, max_distance=None, num_workers=None, chunk_size=500,
+                              lb_window_ratio=0.1):
         """Compute DTW distance matrix between all sequence pairs using multi-processing."""
         print("\n=== Computing DTW Distance Matrix ===")
 
@@ -1550,6 +1604,26 @@ class ScriptClusterer:
 
         if chunk_size is None or chunk_size <= 0:
             chunk_size = 500
+
+        encoded_sequences = self.encoded_sequences if self.encoded_sequences else None
+        lb_ratio = max(0.0, lb_window_ratio or 0.0)
+        lb_enabled = bool(encoded_sequences) and lb_ratio > 0.0 and max_distance is not None
+
+        if lb_enabled:
+            non_empty_lengths = [len(seq) for seq in encoded_sequences if len(seq) > 0]
+            max_encoded_len = max(non_empty_lengths) if non_empty_lengths else 1
+            expected_radius = max(1, int(max_encoded_len * lb_ratio))
+            print(
+                f"LB_Keogh pruning enabled (window ratio={lb_ratio:.2f}, approx radius={expected_radius}, "
+                f"max_distance={max_distance})."
+            )
+        else:
+            if max_distance is None:
+                print("LB_Keogh pruning disabled (no max_distance cap provided).")
+            elif not encoded_sequences:
+                print("LB_Keogh pruning disabled (encoded sequences unavailable).")
+            elif lb_ratio <= 0.0:
+                print("LB_Keogh pruning disabled (window ratio <= 0).")
 
         embedding_lookup = self.token_embeddings if self.token_embeddings else None
         if embedding_lookup:
@@ -1578,26 +1652,50 @@ class ScriptClusterer:
             if chunk:
                 yield chunk
 
+        total_pruned = 0
+
         if num_workers == 1:
             print("Multi-processing disabled (worker count = 1).")
             with tqdm(total=total_pairs, desc="Computing distances") as pbar:
                 for chunk in chunk_generator():
                     for i, j in chunk:
+                        if lb_enabled:
+                            radius = max(
+                                1,
+                                int(max(len(encoded_sequences[i]), len(encoded_sequences[j])) * lb_ratio)
+                            )
+                            lower_bound = ScriptClusterer.lb_improved(
+                                encoded_sequences[i], encoded_sequences[j], radius
+                            )
+                            if lower_bound >= max_distance:
+                                total_pruned += 1
+                                dist = float(max_distance)
+                                self.distance_matrix[i, j] = dist
+                                self.distance_matrix[j, i] = dist
+                                continue
+
                         dist = ScriptClusterer.categorical_dtw_distance(
                             self.sequences[i],
                             self.sequences[j],
                             embedding_lookup
                         )
-                        if max_distance and dist > max_distance:
+                        if max_distance is not None and dist > max_distance:
                             dist = max_distance
                         self.distance_matrix[i, j] = dist
                         self.distance_matrix[j, i] = dist
                     pbar.update(len(chunk))
         else:
             with Pool(processes=num_workers, initializer=_init_dtw_worker,
-                      initargs=(self.sequences, max_distance, embedding_lookup)) as pool:
+                      initargs=(
+                          self.sequences,
+                          encoded_sequences,
+                          max_distance,
+                          embedding_lookup,
+                          lb_ratio if lb_enabled else 0.0,
+                      )) as pool:
                 with tqdm(total=total_pairs, desc="Computing distances") as pbar:
-                    for chunk_result in pool.imap_unordered(_dtw_worker, chunk_generator()):
+                    for chunk_result, pruned in pool.imap_unordered(_dtw_worker, chunk_generator()):
+                        total_pruned += pruned
                         for i, j, dist in chunk_result:
                             self.distance_matrix[i, j] = dist
                             self.distance_matrix[j, i] = dist
@@ -1607,6 +1705,8 @@ class ScriptClusterer:
         print(f"Distance matrix shape: {self.distance_matrix.shape}")
         print(f"Distance range: [{self.distance_matrix.min():.2f}, {self.distance_matrix.max():.2f}]")
         print(f"Mean distance: {self.distance_matrix.mean():.2f}")
+        if total_pruned:
+            print(f"LB_Keogh pruning skipped {total_pruned} DTW computations (~{(total_pruned / total_pairs) * 100:.1f}% of pairs).")
 
     def hdbscan_clustering(self, min_cluster_size=5, min_samples=None, cluster_selection_epsilon=0.0):
         """Cluster traces using HDBSCAN over the DTW distance matrix."""
@@ -1915,13 +2015,15 @@ class ScriptClusterer:
 _DTW_WORKER_CONTEXT = {}
 
 
-def _init_dtw_worker(sequences, max_distance, token_embeddings):
+def _init_dtw_worker(sequences, encoded_sequences, max_distance, token_embeddings, lb_window_ratio):
     """Initializer for DTW worker processes."""
     global _DTW_WORKER_CONTEXT
     _DTW_WORKER_CONTEXT = {
         'sequences': sequences,
+        'encoded_sequences': encoded_sequences,
         'max_distance': max_distance,
-        'token_embeddings': token_embeddings
+        'token_embeddings': token_embeddings,
+        'lb_window_ratio': lb_window_ratio
     }
 
 
@@ -1930,13 +2032,29 @@ def _dtw_worker(pairs):
     sequences = _DTW_WORKER_CONTEXT['sequences']
     max_distance = _DTW_WORKER_CONTEXT['max_distance']
     token_embeddings = _DTW_WORKER_CONTEXT.get('token_embeddings')
+    encoded_sequences = _DTW_WORKER_CONTEXT.get('encoded_sequences')
+    lb_ratio = _DTW_WORKER_CONTEXT.get('lb_window_ratio', 0.0)
+    lb_enabled = bool(encoded_sequences) and max_distance is not None and lb_ratio > 0.0
     results = []
+    pruned = 0
     for i, j in pairs:
+        if lb_enabled:
+            radius = max(
+                1,
+                int(max(len(encoded_sequences[i]), len(encoded_sequences[j])) * lb_ratio)
+            )
+            lower_bound = ScriptClusterer.lb_improved(
+                encoded_sequences[i], encoded_sequences[j], radius
+            )
+            if lower_bound >= max_distance:
+                pruned += 1
+                results.append((i, j, float(max_distance)))
+                continue
         dist = ScriptClusterer.categorical_dtw_distance(sequences[i], sequences[j], token_embeddings)
-        if max_distance and dist > max_distance:
+        if max_distance is not None and dist > max_distance:
             dist = max_distance
         results.append((i, j, dist))
-    return results
+    return results, pruned
 
 
 _ENCODER_WORKER_CONTEXT = {}
@@ -1977,6 +2095,10 @@ def main():
                         help='Number of worker processes for DTW computation (default: CPU count - 1)')
     parser.add_argument('--dtw-chunk-size', type=int, default=500,
                         help='Number of pairwise distances per worker batch')
+    parser.add_argument('--dtw-max-distance', type=float, default=None,
+                        help='Optional cap for DTW distances; enables early abandoning via lower bounds')
+    parser.add_argument('--dtw-lb-ratio', type=float, default=0.1,
+                        help='Fraction of the sequence length to use as the LB_Keogh window (<=0 disables)')
     parser.add_argument('--output', default='clustering_results.pkl',
                         help='Output file for results')
     parser.add_argument('--load', type=str, default=None,
@@ -2012,8 +2134,10 @@ def main():
 
         # Compute DTW distances
         clusterer.compute_dtw_distances(
+            max_distance=args.dtw_max_distance,
             num_workers=args.dtw_workers,
-            chunk_size=args.dtw_chunk_size
+            chunk_size=args.dtw_chunk_size,
+            lb_window_ratio=args.dtw_lb_ratio
         )
 
         # Perform clustering
