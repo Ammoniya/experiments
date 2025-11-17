@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
+from multiprocessing import Pool, cpu_count
 
 import esprima
 from tree_sitter import Parser, Language
@@ -345,6 +346,11 @@ def process_js_file(js_path: Path, force: bool = False) -> Tuple[str, Optional[P
     return "written", fp.output_path
 
 
+def _worker_process(task: Tuple[Path, bool]) -> Tuple[str, Optional[Path]]:
+    js_path, force = task
+    return process_js_file(js_path, force=force)
+
+
 def build_argparser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Compute AST fingerprints for every loaded_js/*.js payload."
@@ -355,6 +361,8 @@ def build_argparser() -> argparse.ArgumentParser:
                         help="Recompute fingerprints even if cached files exist.")
     parser.add_argument("--limit", type=int, default=None,
                         help="Only process this many files (useful for smoke tests).")
+    parser.add_argument("--workers", type=int, default=None,
+                        help="Number of parallel workers. Defaults to CPU count.")
     return parser
 
 
@@ -380,16 +388,39 @@ def main(argv: Optional[List[str]] = None) -> int:
     failures = 0
     non_js = 0
 
-    for js_path in tqdm(js_files, desc="Generating AST fingerprints"):
-        status, _ = process_js_file(js_path, force=args.force)
-        if status == "written":
-            processed += 1
-        elif status == "cached":
-            cached += 1
-        elif status == "non_js":
-            non_js += 1
-        else:
-            failures += 1
+    worker_count = args.workers or cpu_count() or 1
+    worker_count = max(1, worker_count)
+
+    def update_counters(result_iterable):
+        nonlocal processed, cached, failures, non_js
+        for status, _ in result_iterable:
+            if status == "written":
+                processed += 1
+            elif status == "cached":
+                cached += 1
+            elif status == "non_js":
+                non_js += 1
+            else:
+                failures += 1
+
+    if worker_count == 1 or len(js_files) == 1:
+        update_counters(
+            tqdm(
+                (process_js_file(js_path, force=args.force) for js_path in js_files),
+                total=len(js_files),
+                desc="Generating AST fingerprints",
+            )
+        )
+    else:
+        tasks = ((js_path, args.force) for js_path in js_files)
+        with Pool(processes=worker_count) as pool:
+            update_counters(
+                tqdm(
+                    pool.imap_unordered(_worker_process, tasks),
+                    total=len(js_files),
+                    desc=f"Generating AST fingerprints (x{worker_count})",
+                )
+            )
 
     print("\n=== AST fingerprint summary ===")
     print(f"Total JS files scanned : {len(js_files)}")
