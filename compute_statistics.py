@@ -3,7 +3,11 @@ import json
 import shutil
 from pathlib import Path
 from typing import Dict, Optional
+from urllib.parse import urlparse
 from tqdm import tqdm
+
+
+BLACKLISTED_DOMAINS = ("wix.com", "weebly.com", "shopify.com", "blogspot.com")
 
 
 def is_file_non_empty(filepath: Path) -> bool:
@@ -25,16 +29,54 @@ def csv_has_data_rows(csv_path: Path) -> bool:
         return False
 
 
-def check_is_wordpress_fast(fingerprint_path: Path) -> bool:
+def load_fingerprint_data(fingerprint_path: Path) -> Optional[Dict]:
+    """Return parsed fingerprint data or None on failure."""
     try:
         if not is_file_non_empty(fingerprint_path):
-            return False
+            return None
 
         with open(fingerprint_path, 'r') as f:
-            data = json.load(f)
-            return data.get('is_wordpress', False) is True
+            return json.load(f)
     except (json.JSONDecodeError, IOError, OSError):
+        return None
+
+
+def normalize_host(url: str) -> Optional[str]:
+    """Return a normalized hostname for comparisons."""
+    if not url:
+        return None
+
+    candidate = url
+    if "://" not in candidate:
+        candidate = f"http://{candidate}"
+
+    try:
+        parsed = urlparse(candidate)
+    except ValueError:
+        return None
+
+    host = parsed.netloc or parsed.path
+    host = host.split('/')[0].lower()
+    if host.startswith("www."):
+        host = host[4:]
+    return host or None
+
+
+def is_blacklisted_domain(host: Optional[str]) -> bool:
+    if not host:
         return False
+
+    host = host.lower()
+    return any(host == domain or host.endswith(f".{domain}") for domain in BLACKLISTED_DOMAINS)
+
+
+def is_url_blacklisted(fingerprint_data: Optional[Dict]) -> bool:
+    if not fingerprint_data:
+        return False
+
+    url = fingerprint_data.get('url')
+    normalized_host = normalize_host(url) if url else None
+    return is_blacklisted_domain(normalized_host)
 
 
 def compute_statistics(event_data_dir: str, copy_to_digest: bool = False) -> Dict[str, int]:
@@ -59,7 +101,8 @@ def compute_statistics(event_data_dir: str, copy_to_digest: bool = False) -> Dic
         'has_both_and_loaded_js_index': 0,
         'has_both_wordpress_and_loaded_js_index': 0,
         'copied_to_digest': 0,
-        'skipped_already_exists': 0
+        'skipped_already_exists': 0,
+        'skipped_blacklisted_domain': 0,
     }
 
     print("Scanning directory structure...")
@@ -86,6 +129,12 @@ def compute_statistics(event_data_dir: str, copy_to_digest: bool = False) -> Dic
         has_fingerprint = is_file_non_empty(fingerprint_path)
         has_loaded_js = csv_has_data_rows(loaded_js_index_path)
 
+        fingerprint_data: Optional[Dict] = None
+        if has_fingerprint:
+            fingerprint_data = load_fingerprint_data(fingerprint_path)
+
+        is_wordpress = bool(fingerprint_data and fingerprint_data.get('is_wordpress', False))
+
         if has_trace:
             stats['has_trace_v2'] += 1
 
@@ -96,7 +145,6 @@ def compute_statistics(event_data_dir: str, copy_to_digest: bool = False) -> Dic
         if has_both:
             stats['has_both_trace_fingerprint'] += 1
 
-            is_wordpress = check_is_wordpress_fast(fingerprint_path)
             if is_wordpress:
                 stats['has_both_and_is_wordpress'] += 1
 
@@ -106,10 +154,14 @@ def compute_statistics(event_data_dir: str, copy_to_digest: bool = False) -> Dic
         if has_both and has_loaded_js:
             stats['has_both_and_loaded_js_index'] += 1
 
-            if check_is_wordpress_fast(fingerprint_path):
+            if is_wordpress:
                 stats['has_both_wordpress_and_loaded_js_index'] += 1
 
                 if copy_to_digest and digest_path:
+                    if is_url_blacklisted(fingerprint_data):
+                        stats['skipped_blacklisted_domain'] += 1
+                        continue
+
                     try:
                         url_hash = item.parent.name
                         timestamp = item.name
@@ -147,6 +199,7 @@ def print_statistics(stats: Dict[str, int], copy_enabled: bool = False) -> None:
         print()
         print(f"Copied to experiment_data: {stats['copied_to_digest']}")
         print(f"Skipped (already exists): {stats['skipped_already_exists']}")
+        print(f"Skipped (blacklisted domain): {stats['skipped_blacklisted_domain']}")
 
     print()
     print("=" * 80)
