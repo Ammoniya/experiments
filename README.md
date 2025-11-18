@@ -81,6 +81,12 @@ DTW_MAX_DISTANCE=150 DTW_LB_RATIO=0.08 ./run_clustering.sh --require-ast-preview
 
 # Reuse a specific cache directory explicitly.
 ./run_clustering.sh --use-cache --timestamp 20251112 --cache-key 20251112-2 --require-ast-preview
+
+# Process multiple days in sequence without launching the Dash UI.
+SKIP_VIZ=1 for ts in 20251111 20251112 20251113; do \
+  ./run_clustering.sh --no-cache --require-ast-preview --disable-dtw-pruning \
+    --timestamp "$ts" --max-scripts 0 --min-cluster-size 10; \
+done
 ```
 
 ## Cache layout
@@ -108,3 +114,18 @@ A successful run writes:
 - `cache/<cache-key>/cache_config.json` – snapshot of the options used to create that cache (command string, timestamps, DTW settings, AST filter, etc.).
 
 Running `./run_clustering.sh --require-ast-preview` ensures every trace in these artifacts already has an AST preview, which simplifies AST-centric reviews. Feel free to mix and match the options above to match your analysis goals.
+
+## Building a consolidated dashboard
+
+After you compute clusters for different days/timestamp groups, summarize the most interesting clusters per run with:
+
+```bash
+./aggregate_cluster_reports.py --cache-root cache --output cache_summary.html --top-n 5
+```
+
+The script scans every `cache/<cache-key>/cluster_report.json`, computes a simple “interesting score” (mix of suspicious events, silhouette, and size), and writes an HTML dashboard highlighting the top `N` clusters for each timestamp key. Each entry includes:
+
+- A link to the raw `cluster_report.json` for deeper inspection.
+- A ready-to-run reuse command (e.g., `./run_clustering.sh --use-cache --cache-key 20251112-2 --timestamp 20251112`) so you can relaunch the Dash visualization for that cache.
+
+Open `cache_summary.html` in a browser to explore daily highlights and jump directly into the corresponding cache directories.
