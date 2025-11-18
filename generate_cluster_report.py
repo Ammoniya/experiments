@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Generate a text-based report for every cluster, mirroring the data surfaced
+Build a structured JSON report for every cluster, mirroring the data surfaced
 in the Dash dashboard (metadata, WordPress assets, event summaries, etc.).
 """
 
@@ -8,10 +8,9 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import pickle
+import sys
 from collections import Counter, defaultdict
-from contextlib import redirect_stdout
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
@@ -40,62 +39,36 @@ def load_results(results_path: Path) -> Dict[str, Any]:
         return pickle.load(fh)
 
 
-def summarize_event_sequence(events: List[str], limit: int = 20) -> str:
+def summarize_event_sequence(events: List[str], limit: int = 20) -> List[str]:
     if not events:
-        return "No events recorded"
-    tokens = events[:limit]
-    suffix = "" if len(events) <= limit else ", …"
-    return ", ".join(tokens) + suffix
+        return []
+    return events[:limit]
 
 
-def summarize_events_counter(events: List[str], limit: int = 10) -> str:
-    if not events:
-        return "None"
-    counter = Counter(events)
-    lines = [
-        f"{event}: {count}"
-        for event, count in counter.most_common(limit)
-    ]
-    return "\n        ".join(lines)
+def summarize_events_counter(events: List[str], limit: int = 10) -> List[Dict[str, Any]]:
+    counter = Counter(events or [])
+    return [{"event": event, "count": count} for event, count in counter.most_common(limit)]
 
 
-def summarize_capabilities(cap_counts: Dict[str, int], limit: int = 8) -> str:
-    if not cap_counts:
-        return "None"
-    counter = Counter(cap_counts)
-    lines = [
-        f"{cap}: {count}"
-        for cap, count in counter.most_common(limit)
-    ]
-    return "\n        ".join(lines)
+def summarize_capabilities(cap_counts: Dict[str, int], limit: int = 8) -> List[Dict[str, Any]]:
+    counter = Counter(cap_counts or {})
+    return [{"capability": cap, "count": count} for cap, count in counter.most_common(limit)]
 
 
-def format_wp_trace(items: List[Dict[str, Any]]) -> str:
-    if not items:
-        return "None"
+def counter_to_entries(counter: Counter, limit: int | None = None) -> List[Dict[str, Any]]:
+    if not counter:
+        return []
+    pairs = counter.most_common(limit) if limit is not None else counter.most_common()
+    return [{"label": item, "count": count} for item, count in pairs]
 
-    grouped = defaultdict(Counter)
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        name = item.get("name")
-        if not name:
-            continue
-        version = item.get("version") or "unspecified"
-        grouped[name][version] += 1
 
-    if not grouped:
-        return "None"
-
-    lines = []
-    for name in sorted(grouped.keys()):
-        version_counts = grouped[name]
-        version_parts = []
-        for version, count in version_counts.most_common():
-            label = version if version != "unspecified" else "unspecified"
-            version_parts.append(f"{label} ×{count}" if count > 1 else label)
-        lines.append(f"{name}: {', '.join(version_parts)}")
-    return "\n        ".join(lines)
+def safe_float(value: Any) -> Any:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def build_cluster_wp_distribution(traces: List[Dict[str, Any]]) -> Tuple[Counter, Counter]:
@@ -125,16 +98,6 @@ def build_cluster_wp_distribution(traces: List[Dict[str, Any]]) -> Tuple[Counter
     return plugins, themes
 
 
-def format_counter(counter: Counter, title: str, limit: int = 10) -> str:
-    if not counter:
-        return f"{title}: None"
-    lines = [
-        f"{item}: {count}"
-        for item, count in counter.most_common(limit)
-    ]
-    return f"{title}:\n        " + "\n        ".join(lines)
-
-
 def script_path(trace: Dict[str, Any], data_dir: Path) -> str:
     file_name = trace.get("file_name")
     if not file_name:
@@ -145,14 +108,6 @@ def script_path(trace: Dict[str, Any], data_dir: Path) -> str:
         return "Unavailable"
     path = data_dir / url_hash / timestamp / "loaded_js" / file_name
     return str(path)
-
-
-def format_metric(value: Any) -> str:
-    if isinstance(value, (int, float)):
-        if math.isnan(value):
-            return "n/a"
-        return f"{value:.3f}"
-    return "n/a"
 
 
 def build_event_mapping(results: Dict[str, Any]) -> Dict[str, int]:
@@ -302,39 +257,28 @@ def compute_dtw_alignment(
     return info
 
 
-def format_alignment_lines(alignment: Dict[str, Any]) -> List[str]:
-    if not alignment:
-        return ["Alignment not computed."]
-    error = alignment.get("error")
-    if error:
-        return [error]
-
-    coverage_pct = alignment.get("coverage_ratio", 0.0) * 100
-    tail_len = alignment.get("tail_length", 0)
-    total_len = alignment.get("series_length", 0) or 1
-    tail_pct = (tail_len / total_len) * 100 if total_len else 0.0
-    lines = [
-        f"Reference Trace: {alignment.get('representative_trace_id', 'n/a')}",
-        f"Matched Segment: {alignment.get('start_index')} → {alignment.get('end_index')} "
-        f"({alignment.get('matched_length')}/{alignment.get('series_length')} events, "
-        f"{coverage_pct:.1f}% coverage)",
-        f"Tail Length: {tail_len} events ({tail_pct:.1f}%)",
-        f"DTW Distance: {format_metric(alignment.get('distance'))}",
-    ]
-    norm_cost = alignment.get("normalized_distance")
-    if norm_cost is not None:
-        lines.append(f"Normalized Cost: {format_metric(norm_cost)}")
-    tail_preview = alignment.get("tail_preview")
-    if tail_preview and tail_preview != "None":
-        lines.append(f"Tail Events: {tail_preview}")
-    return lines
-
-
 # --------------------------------------------------------------------------- #
 # Report generation
 # --------------------------------------------------------------------------- #
 
-def generate_report(results_path: Path, data_dir: Path) -> None:
+def _serialize_neighbors(entries: List[Any]) -> List[Dict[str, Any]]:
+    serialized: List[Dict[str, Any]] = []
+    for entry in entries or []:
+        if isinstance(entry, dict):
+            other = entry.get("cluster_id")
+            distance = entry.get("distance")
+        else:
+            other, distance = entry
+        try:
+            other_label = int(other)
+            distance_val = float(distance)
+        except (TypeError, ValueError):
+            continue
+        serialized.append({"cluster_id": other_label, "distance": distance_val})
+    return serialized
+
+
+def generate_report(results_path: Path, data_dir: Path) -> Dict[str, Any]:
     results = load_results(results_path)
     traces: List[Dict[str, Any]] = results["traces"]
     distance_matrix = results.get("distance_matrix")
@@ -369,98 +313,43 @@ def generate_report(results_path: Path, data_dir: Path) -> None:
     if not cluster_neighbors:
         cluster_neighbors = compute_cluster_neighbors(distance_matrix, traces, limit=5)
 
-    if overall_silhouette is not None:
-        print(f"Overall silhouette (avg similarity across clusters): {overall_silhouette:.3f}\n")
+    report: Dict[str, Any] = {
+        "results_path": str(results_path),
+        "data_dir": str(data_dir),
+        "overall_silhouette": safe_float(overall_silhouette),
+        "cluster_count": len(clusters),
+        "clusters": [],
+    }
 
     for cluster_id in sorted(clusters.keys()):
         members = clusters[cluster_id]
         plugin_counts, theme_counts = build_cluster_wp_distribution(members)
 
-        print("=" * 100)
-        print(f"CLUSTER {cluster_id}")
-        print("=" * 100)
-        print(f"Count: {len(members)}")
         avg_events = (
             sum(t.get("num_events", 0) for t in members) / len(members)
             if members else 0
         )
-        print(f"Average events per script: {avg_events:.1f}\n")
         sil_score = silhouette_lookup.get(cluster_id)
-        if sil_score is not None:
-            print(f"Average similarity (silhouette): {sil_score:.3f}\n")
-        else:
-            print("Average similarity (silhouette): n/a\n")
         ast_score = ast_similarity_lookup.get(cluster_id)
         ast_scripts = sum(1 for t in members if t.get("ast_unit_vector"))
         ast_total = ast_counts.get(cluster_id, ast_scripts)
-        if ast_scripts >= 2 and isinstance(ast_score, (int, float)):
-            print(f"AST average similarity: {ast_score:.3f} ({ast_scripts}/{len(members)} scripts with AST)\n")
-        elif ast_scripts:
-            print(f"AST average similarity: n/a ({ast_scripts}/{len(members)} scripts with AST)\n")
-        else:
-            print("AST average similarity: n/a (no AST fingerprints)\n")
+        neighbor_entries = _serialize_neighbors(cluster_neighbors.get(cluster_id) or [])
 
-        neighbor_entries = cluster_neighbors.get(cluster_id) or []
-        if neighbor_entries:
-            formatted_neighbors = []
-            for entry in neighbor_entries:
-                if isinstance(entry, dict):
-                    other = entry.get("cluster_id")
-                    distance = entry.get("distance")
-                else:
-                    other, distance = entry
-                try:
-                    other_label = int(other)
-                    distance_val = float(distance)
-                except (TypeError, ValueError):
-                    continue
-                formatted_neighbors.append(f"{other_label} ({distance_val:.3f})")
-            neighbor_str = ", ".join(formatted_neighbors) if formatted_neighbors else "n/a"
-        else:
-            neighbor_str = "n/a"
-        print(f"Closest clusters: {neighbor_str}\n")
+        cluster_entry: Dict[str, Any] = {
+            "cluster_id": cluster_id,
+            "count": len(members),
+            "average_events_per_script": avg_events,
+            "silhouette": safe_float(sil_score),
+            "ast_similarity": safe_float(ast_score),
+            "ast_script_count": ast_scripts,
+            "ast_total_scripts": ast_total,
+            "closest_clusters": neighbor_entries,
+            "wordpress_plugins": counter_to_entries(plugin_counts, limit=20),
+            "wordpress_themes": counter_to_entries(theme_counts, limit=20),
+            "traces": [],
+        }
 
-        print(format_counter(plugin_counts, "Cluster WordPress Plugins"))
-        print(format_counter(theme_counts, "Cluster WordPress Themes"))
-        print()
-
-        for idx, trace in enumerate(sorted(members, key=lambda t: t.get("script_id")), start=1):
-            print(f"{idx}. Trace ID: {trace.get('trace_id')}")
-            print(f"   Cluster: {trace.get('cluster')}")
-            print(f"   Script ID: {trace.get('script_id')}")
-            print(f"   Script Loaded From: {trace.get('script_url')}")
-            print(f"   Scanned Page URL: {trace.get('page_url') or 'Unknown'}")
-            print(f"   URL Hash: {trace.get('url_hash')}")
-            print(f"   Timestamp: {trace.get('timestamp')}")
-            print(f"   Script SHA256: {trace.get('hash') or 'Unavailable'}")
-            print(f"   Script Path: {script_path(trace, data_dir)}")
-            print(f"   Module: {trace.get('is_module')}")
-            print(f"   # Events: {trace.get('num_events')}")
-            print(f"   Suspicious Events: {trace.get('suspicious_event_count', 0)}")
-            print(f"   Trace Silhouette: {format_metric(trace.get('silhouette_score'))}")
-            print(f"   Trace AST Similarity: {format_metric(trace.get('ast_similarity'))}")
-            ast_fp = trace.get('ast_fingerprint') or {}
-            if ast_fp:
-                node_count = ast_fp.get('num_nodes', 0)
-                max_depth = ast_fp.get('max_depth', 0)
-                print(f"   AST Nodes: {node_count} | Max Depth: {max_depth}")
-                node_counts = ast_fp.get('node_type_counts') or {}
-                top_nodes = sorted(node_counts.items(), key=lambda kv: kv[1], reverse=True)[:5]
-                if top_nodes:
-                    node_summary = ", ".join(f"{k}:{v}" for k, v in top_nodes)
-                    print(f"   AST Top Node Types: {node_summary}")
-            else:
-                print("   AST Fingerprint: unavailable")
-            print("   Capability Counts:")
-            print(f"        {summarize_capabilities(trace.get('capability_counts', {}))}")
-            print("   Event Type Distribution:")
-            print(f"        {summarize_events_counter(trace.get('event_sequence', []))}")
-            print("   Event Sequence (first 20):")
-            print(f"        {summarize_event_sequence(trace.get('event_sequence', []))}")
-            print("   WordPress Assets (Trace) - Plugins:")
-            print(f"        {format_wp_trace(trace.get('wordpress_plugins'))}")
-            print("   WordPress Assets (Trace) - Themes:")
-            print(f"        {format_wp_trace(trace.get('wordpress_themes'))}")
+        for trace in sorted(members, key=lambda t: t.get("script_id")):
             trace_idx = trace_index_lookup.get(trace.get("trace_id"), -1)
             alignment = compute_dtw_alignment(
                 trace,
@@ -470,14 +359,54 @@ def generate_report(results_path: Path, data_dir: Path) -> None:
                 cluster_representatives,
                 alignment_cache,
             )
-            print("   Subsequence Alignment:")
-            for line in format_alignment_lines(alignment):
-                print(f"        {line}")
-            print()
+            ast_fp = trace.get("ast_fingerprint") or {}
+            top_nodes = []
+            node_counts = ast_fp.get("node_type_counts") or {}
+            if node_counts:
+                top_nodes = [
+                    {"node_type": label, "count": count}
+                    for label, count in sorted(node_counts.items(), key=lambda kv: kv[1], reverse=True)[:5]
+                ]
+
+            trace_entry = {
+                "trace_id": trace.get("trace_id"),
+                "cluster": trace.get("cluster"),
+                "script_id": trace.get("script_id"),
+                "script_url": trace.get("script_url"),
+                "page_url": trace.get("page_url"),
+                "url_hash": trace.get("url_hash"),
+                "timestamp": trace.get("timestamp"),
+                "script_sha256": trace.get("hash"),
+                "script_path": script_path(trace, data_dir),
+                "is_module": trace.get("is_module"),
+                "num_events": trace.get("num_events"),
+                "suspicious_event_count": trace.get("suspicious_event_count", 0),
+                "trace_silhouette": safe_float(trace.get("silhouette_score")),
+                "trace_ast_similarity": safe_float(trace.get("ast_similarity")),
+                "capability_counts": trace.get("capability_counts", {}),
+                "capability_summary": summarize_capabilities(trace.get("capability_counts", {})),
+                "event_sequence_preview": summarize_event_sequence(trace.get("event_sequence", [])),
+                "event_distribution": summarize_events_counter(trace.get("event_sequence", [])),
+                "wordpress_plugins": trace.get("wordpress_plugins", []),
+                "wordpress_themes": trace.get("wordpress_themes", []),
+                "alignment": alignment,
+                "ast_preview": trace.get("ast_preview"),
+                "ast_fingerprint_summary": {
+                    "num_nodes": ast_fp.get("num_nodes"),
+                    "max_depth": ast_fp.get("max_depth"),
+                    "top_node_types": top_nodes,
+                } if ast_fp else None,
+            }
+
+            cluster_entry["traces"].append(trace_entry)
+
+        report["clusters"].append(cluster_entry)
+
+    return report
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Generate text cluster report with full metadata.")
+    parser = argparse.ArgumentParser(description="Generate JSON cluster report with full metadata.")
     parser.add_argument("--results", default="clustering_results.pkl",
                         help="Path to clustering results pickle file")
     parser.add_argument("--data-dir", default="experiment_data",
@@ -495,12 +424,16 @@ def main():
         raise SystemExit(f"Data directory not found: {data_dir}")
 
     output_path = Path(args.output).resolve() if args.output else None
+    report = generate_report(results_path, data_dir)
+
     if output_path:
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        with output_path.open("w", encoding="utf-8") as fh, redirect_stdout(fh):
-            generate_report(results_path, data_dir)
+        with output_path.open("w", encoding="utf-8") as fh:
+            json.dump(report, fh, indent=2)
+            fh.write("\n")
     else:
-        generate_report(results_path, data_dir)
+        json.dump(report, sys.stdout, indent=2)
+        print()
 
 
 if __name__ == "__main__":

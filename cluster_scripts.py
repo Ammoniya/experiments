@@ -207,7 +207,13 @@ WEAK_ATTRIBUTE_PREFIXES = (
 class ScriptClusterer:
     """Cluster JavaScript scripts based on CDP event traces"""
 
-    def __init__(self, experiment_data_dir, max_sequence_length=2000):
+    def __init__(
+        self,
+        experiment_data_dir,
+        max_sequence_length=2000,
+        require_ast_preview=False,
+        allowed_timestamps=None,
+    ):
         self.experiment_data_dir = Path(experiment_data_dir)
         self.traces = []
         self.sequences = []
@@ -226,6 +232,22 @@ class ScriptClusterer:
         self.token_embeddings = {}
         self.embedding_dim = 0
         self.semantic_cost_enabled = False
+        self.require_ast_preview = require_ast_preview
+        if allowed_timestamps:
+            self.allowed_timestamp_list = list(allowed_timestamps)
+            self.allowed_timestamps = set(self.allowed_timestamp_list)
+        else:
+            self.allowed_timestamp_list = None
+            self.allowed_timestamps = None
+
+    def timestamp_matches(self, directory_name):
+        """Return True if the given timestamp directory passes the filter."""
+        if not self.allowed_timestamp_list:
+            return True
+        for entry in self.allowed_timestamp_list:
+            if directory_name == entry or directory_name.startswith(entry):
+                return True
+        return False
 
     @staticmethod
     def get_event_argument(event):
@@ -1183,12 +1205,22 @@ class ScriptClusterer:
         byscripts_files = list(self.experiment_data_dir.rglob('byscripts.json'))
         print(f"Found {len(byscripts_files)} byscripts.json files")
 
+        if self.allowed_timestamp_list:
+            print(f"Timestamp filter enabled: {', '.join(self.allowed_timestamp_list)}")
+
+        filtered_without_ast = 0
+        skipped_timestamps = 0
+
         for byscripts_file in tqdm(byscripts_files, desc="Processing files"):
             try:
                 # Extract metadata from path
                 parts = byscripts_file.parts
                 url_hash = parts[-3]
                 timestamp = parts[-2]
+
+                if not self.timestamp_matches(timestamp):
+                    skipped_timestamps += 1
+                    continue
 
                 # Load script metadata
                 metadata_map = self.load_script_metadata(url_hash, timestamp)
@@ -1276,6 +1308,10 @@ class ScriptClusterer:
 
                     self.attach_ast_metadata(trace, url_hash, timestamp, script_metadata)
 
+                    if self.require_ast_preview and not (trace.get('ast_preview') or '').strip():
+                        filtered_without_ast += 1
+                        continue
+
                     self.traces.append(trace)
 
                     # Limit for testing
@@ -1290,6 +1326,10 @@ class ScriptClusterer:
                 continue
 
         print(f"\nExtracted {len(self.traces)} script traces")
+        if self.require_ast_preview:
+            print(f"Filtered out {filtered_without_ast} scripts without AST previews.")
+        if self.allowed_timestamps is not None:
+            print(f"Skipped {skipped_timestamps} files outside the timestamp filter.")
 
         # Print event type statistics
         all_events = []
@@ -1969,7 +2009,9 @@ class ScriptClusterer:
             'cluster_metadata': self.cluster_metadata,
             'token_embeddings': self.token_embeddings,
             'embedding_dim': self.embedding_dim,
-            'semantic_cost_enabled': self.semantic_cost_enabled
+            'semantic_cost_enabled': self.semantic_cost_enabled,
+            'require_ast_preview': self.require_ast_preview,
+            'allowed_timestamps': list(self.allowed_timestamp_list) if self.allowed_timestamp_list else None
         }
 
         with open(output_file, 'wb') as f:
@@ -2008,6 +2050,14 @@ class ScriptClusterer:
             'semantic_cost_enabled',
             bool(clusterer.token_embeddings)
         )
+        clusterer.require_ast_preview = results.get('require_ast_preview', False)
+        allowed_ts = results.get('allowed_timestamps')
+        if allowed_ts:
+            clusterer.allowed_timestamp_list = list(allowed_ts)
+            clusterer.allowed_timestamps = set(allowed_ts)
+        else:
+            clusterer.allowed_timestamp_list = None
+            clusterer.allowed_timestamps = None
 
         return clusterer
 
@@ -2105,6 +2155,10 @@ def main():
                         help='Load existing results instead of recomputing')
     parser.add_argument('--max-seq-length', type=int, default=2000,
                         help='Maximum length for compressed sequences')
+    parser.add_argument('--require-ast-preview', action='store_true',
+                        help='Filter traces to those with AST previews available')
+    parser.add_argument('--timestamp', dest='timestamps', action='append',
+                        help='Restrict processing to specific timestamp directories (repeatable)')
 
     args = parser.parse_args()
 
@@ -2117,7 +2171,12 @@ def main():
         clusterer.summarize_capability_clusters()
     else:
         # Create clusterer
-        clusterer = ScriptClusterer(args.data_dir, max_sequence_length=args.max_seq_length)
+        clusterer = ScriptClusterer(
+            args.data_dir,
+            max_sequence_length=args.max_seq_length,
+            require_ast_preview=args.require_ast_preview,
+            allowed_timestamps=args.timestamps
+        )
 
         # Extract traces
         clusterer.extract_traces(max_scripts=args.max_scripts)

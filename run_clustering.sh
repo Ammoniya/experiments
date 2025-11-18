@@ -27,6 +27,12 @@ Options:
   --dtw-lb-ratio       Override the LB_Keogh window ratio passed to cluster_scripts.py.
   --disable-dtw-pruning
                         Skip DTW lower-bound pruning (restores legacy behavior).
+  --require-ast-preview
+                        Filter to scripts that already have cached AST previews.
+  --timestamp VALUE    Restrict processing to one or more timestamp directories (repeatable).
+  --max-scripts VALUE  Limit how many scripts are processed (use 0 for no limit).
+  --min-cluster-size VALUE
+                        Override the minimum HDBSCAN cluster size.
   -h, --help           Show this help message and exit.
 
 Environment:
@@ -35,6 +41,7 @@ Environment:
   DTW_LB_RATIO         Default value for --dtw-lb-ratio.
   DTW_PRUNING_ENABLED  Set to 0 to disable pruning without editing the script.
   TSNE_FORCE=1         Recompute t-SNE embeddings even if cached ones exist.
+  TIMESTAMP_FILTER     Comma/space separated list of timestamps (equivalent to repeating --timestamp).
   JOBLIB_TEMP_FOLDER   Writable directory for joblib's temp storage (defaults to .joblib_tmp).
 
 Examples:
@@ -43,10 +50,42 @@ Examples:
 EOF
 }
 
+add_timestamp_filter() {
+    local value="$1"
+    if [ -z "$value" ]; then
+        return
+    fi
+    for existing in "${TIMESTAMP_FILTERS[@]}"; do
+        if [ "$existing" = "$value" ]; then
+            return
+        fi
+    done
+    TIMESTAMP_FILTERS+=("$value")
+}
+
+parse_timestamp_values() {
+    local raw="$1"
+    if [ -z "$raw" ]; then
+        return
+    fi
+    raw="${raw//,/ }"
+    for token in $raw; do
+        add_timestamp_filter "$token"
+    done
+}
+
 USE_CACHE="${USE_CACHE:-0}"
 DTW_PRUNING_ENABLED="${DTW_PRUNING_ENABLED:-1}"
 DTW_MAX_DISTANCE="${DTW_MAX_DISTANCE:-$DEFAULT_DTW_MAX_DISTANCE}"
 DTW_LB_RATIO="${DTW_LB_RATIO:-$DEFAULT_DTW_LB_RATIO}"
+REQUIRE_AST_PREVIEW="${REQUIRE_AST_PREVIEW:-0}"
+TIMESTAMP_FILTER="${TIMESTAMP_FILTER:-}"
+MAX_SCRIPTS_OVERRIDE=""
+MIN_CLUSTER_OVERRIDE=""
+TIMESTAMP_FILTERS=()
+if [ -n "$TIMESTAMP_FILTER" ]; then
+    parse_timestamp_values "$TIMESTAMP_FILTER"
+fi
 POSITIONAL_ARGS=()
 
 while [[ $# -gt 0 ]]; do
@@ -79,6 +118,53 @@ while [[ $# -gt 0 ]]; do
             DTW_PRUNING_ENABLED=0
             shift
             ;;
+        --require-ast-preview)
+            REQUIRE_AST_PREVIEW=1
+            shift
+            ;;
+        --max-scripts)
+            if [ -z "${2:-}" ]; then
+                echo "--max-scripts requires a numeric value (use 0 for no limit)"
+                exit 1
+            fi
+            MAX_SCRIPTS_OVERRIDE="$2"
+            shift 2
+            ;;
+        --min-cluster-size)
+            if [ -z "${2:-}" ]; then
+                echo "--min-cluster-size requires a numeric value"
+                exit 1
+            fi
+            MIN_CLUSTER_OVERRIDE="$2"
+            shift 2
+            ;;
+        --timestamp)
+            shift
+            consumed_any=0
+            if [ $# -eq 0 ]; then
+                echo "--timestamp requires at least one value (e.g., 20251112 20251113)"
+                exit 1
+            fi
+            while [[ $# -gt 0 ]]; do
+                case "$1" in
+                    --|--*)
+                        break
+                        ;;
+                    -*)
+                        break
+                        ;;
+                    *)
+                        parse_timestamp_values "$1"
+                        consumed_any=1
+                        shift
+                        ;;
+                esac
+            done
+            if [ "$consumed_any" -eq 0 ]; then
+                echo "--timestamp requires at least one value (e.g., 20251112)"
+                exit 1
+            fi
+            ;;
         -h|--help)
             show_help
             exit 0
@@ -99,13 +185,26 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-if [ ${#POSITIONAL_ARGS[@]} -ge 1 ]; then
+if [ "$#" -gt 0 ]; then
+    POSITIONAL_ARGS+=("$@")
+fi
+
+if [ "$USE_CACHE" -eq 1 ] && [ ${#TIMESTAMP_FILTERS[@]} -eq 0 ]; then
+    echo "--use-cache requires at least one timestamp via --timestamp or TIMESTAMP_FILTER."
+    exit 1
+fi
+
+if [ -n "$MAX_SCRIPTS_OVERRIDE" ]; then
+    MAX_SCRIPTS="$MAX_SCRIPTS_OVERRIDE"
+elif [ ${#POSITIONAL_ARGS[@]} -ge 1 ]; then
     MAX_SCRIPTS="${POSITIONAL_ARGS[0]}"
 else
     MAX_SCRIPTS=100
 fi
 
-if [ ${#POSITIONAL_ARGS[@]} -ge 2 ]; then
+if [ -n "$MIN_CLUSTER_OVERRIDE" ]; then
+    MIN_CLUSTER_SIZE="$MIN_CLUSTER_OVERRIDE"
+elif [ ${#POSITIONAL_ARGS[@]} -ge 2 ]; then
     MIN_CLUSTER_SIZE="${POSITIONAL_ARGS[1]}"
 else
     MIN_CLUSTER_SIZE=5
@@ -118,7 +217,23 @@ echo ""
 
 # Configuration
 DATA_DIR="experiment_data"
-OUTPUT="$DEFAULT_OUTPUT"
+
+if [ ${#TIMESTAMP_FILTERS[@]} -gt 0 ]; then
+    TIMESTAMP_KEY="${TIMESTAMP_FILTERS[0]}"
+    if [ ${#TIMESTAMP_FILTERS[@]} -gt 1 ]; then
+        for ts in "${TIMESTAMP_FILTERS[@]:1}"; do
+            TIMESTAMP_KEY="$TIMESTAMP_KEY-$ts"
+        done
+    fi
+else
+    TIMESTAMP_KEY="all"
+fi
+
+CACHE_ROOT="cache"
+RUN_CACHE_DIR="$CACHE_ROOT/$TIMESTAMP_KEY"
+OUTPUT="$RUN_CACHE_DIR/$DEFAULT_OUTPUT"
+REPORT_FILE="$RUN_CACHE_DIR/cluster_report.json"
+mkdir -p "$RUN_CACHE_DIR"
 
 echo "Configuration:"
 echo "  Data directory: $DATA_DIR"
@@ -135,6 +250,18 @@ if [ "$USE_CACHE" -eq 1 ]; then
 else
     echo "  Cache mode: disabled"
 fi
+if [ "$REQUIRE_AST_PREVIEW" -eq 1 ]; then
+    echo "  AST preview filter: enabled (scripts missing previews will be skipped)"
+else
+    echo "  AST preview filter: disabled"
+fi
+if [ ${#TIMESTAMP_FILTERS[@]} -gt 0 ]; then
+    echo "  Timestamp filter: ${TIMESTAMP_FILTERS[*]}"
+else
+    echo "  Timestamp filter: none"
+fi
+echo "  Cache key: $TIMESTAMP_KEY"
+echo "  Cache directory: $RUN_CACHE_DIR"
 echo "  JOBLIB_TEMP_FOLDER: $JOBLIB_TEMP_FOLDER"
 echo ""
 
@@ -216,13 +343,23 @@ if [ "$USE_CACHE" -eq 0 ]; then
     if [ "$DTW_PRUNING_ENABLED" -eq 1 ]; then
         DTW_ARGS+=(--dtw-max-distance "$DTW_MAX_DISTANCE" --dtw-lb-ratio "$DTW_LB_RATIO")
     fi
+    FILTER_ARGS=()
+    if [ "$REQUIRE_AST_PREVIEW" -eq 1 ]; then
+        FILTER_ARGS+=(--require-ast-preview)
+    fi
+    if [ ${#TIMESTAMP_FILTERS[@]} -gt 0 ]; then
+        for ts in "${TIMESTAMP_FILTERS[@]}"; do
+            FILTER_ARGS+=(--timestamp "$ts")
+        done
+    fi
 
     python3 cluster_scripts.py \
         --data-dir "$DATA_DIR" \
         --max-scripts "$MAX_SCRIPTS" \
         --min-cluster-size "$MIN_CLUSTER_SIZE" \
         --output "$OUTPUT" \
-        "${DTW_ARGS[@]}"
+        "${DTW_ARGS[@]}" \
+        "${FILTER_ARGS[@]}"
 
     if [ $? -ne 0 ]; then
         echo "Clustering failed!"
@@ -266,10 +403,9 @@ else
     echo "Failed to build subsequence alignment cache. Visualization will fall back to error messages."
 fi
 
-# Step 6: Generate text report
+# Step 6: Generate JSON report
 echo ""
-echo "[6/7] Generating cluster report..."
-REPORT_FILE="cluster_report.txt"
+echo "[6/7] Generating cluster report (JSON)..."
 python3 generate_cluster_report.py \
     --results "$OUTPUT" \
     --data-dir "$DATA_DIR" \
