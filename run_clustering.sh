@@ -3,6 +3,8 @@
 
 set -e
 
+ORIGINAL_COMMAND="$0 $*"
+
 DEFAULT_OUTPUT="clustering_results.pkl"
 DEFAULT_DTW_MAX_DISTANCE="${DEFAULT_DTW_MAX_DISTANCE:-200}"
 DEFAULT_DTW_LB_RATIO="${DEFAULT_DTW_LB_RATIO:-0.05}"
@@ -33,6 +35,7 @@ Options:
   --max-scripts VALUE  Limit how many scripts are processed (use 0 for no limit).
   --min-cluster-size VALUE
                         Override the minimum HDBSCAN cluster size.
+  --cache-key VALUE    Explicit cache directory key (e.g., 20251112-1) for reuse or custom labeling.
   -h, --help           Show this help message and exit.
 
 Environment:
@@ -42,6 +45,7 @@ Environment:
   DTW_PRUNING_ENABLED  Set to 0 to disable pruning without editing the script.
   TSNE_FORCE=1         Recompute t-SNE embeddings even if cached ones exist.
   TIMESTAMP_FILTER     Comma/space separated list of timestamps (equivalent to repeating --timestamp).
+  CACHE_KEY            Override cache directory name (needed with --use-cache).
   JOBLIB_TEMP_FOLDER   Writable directory for joblib's temp storage (defaults to .joblib_tmp).
 
 Examples:
@@ -74,12 +78,92 @@ parse_timestamp_values() {
     done
 }
 
+write_cache_metadata() {
+    if [ "$USE_CACHE" -ne 0 ]; then
+        return
+    fi
+    local config_path="$RUN_CACHE_DIR/cache_config.json"
+    local timestamp_serialized=""
+    if [ ${#TIMESTAMP_FILTERS[@]} -gt 0 ]; then
+        timestamp_serialized=$(printf "%s\n" "${TIMESTAMP_FILTERS[@]}")
+    fi
+
+    RUN_COMMAND="$ORIGINAL_COMMAND" \
+    TIMESTAMP_FILTERS_ENV="$timestamp_serialized" \
+    CACHE_CONFIG_PATH="$config_path" \
+    CACHE_KEY_NAME_ENV="$CACHE_DIR_KEY" \
+    TIMESTAMP_KEY_ENV="$TIMESTAMP_KEY" \
+    MAX_SCRIPTS_ENV="$MAX_SCRIPTS" \
+    MIN_CLUSTER_ENV="$MIN_CLUSTER_SIZE" \
+    REQUIRE_AST_ENV="$REQUIRE_AST_PREVIEW" \
+    DTW_MAX_ENV="$DTW_MAX_DISTANCE" \
+    DTW_LB_ENV="$DTW_LB_RATIO" \
+    DTW_PRUNING_ENV="$DTW_PRUNING_ENABLED" \
+    DATA_DIR_ENV="$DATA_DIR" \
+    python3 <<'PY'
+import json
+import os
+import time
+
+def parse_int(name):
+    value = os.environ.get(name)
+    if value in (None, "", "None"):
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        try:
+            return float(value)
+        except ValueError:
+            return value
+
+def parse_float(name):
+    value = os.environ.get(name)
+    if value in (None, "", "None"):
+        return None
+    try:
+        return float(value)
+    except ValueError:
+        return value
+
+config = {
+    "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    "command": os.environ.get("RUN_COMMAND"),
+    "timestamp_filters": [
+        line for line in os.environ.get("TIMESTAMP_FILTERS_ENV", "").splitlines() if line
+    ],
+    "timestamp_key": os.environ.get("TIMESTAMP_KEY_ENV"),
+    "cache_key": os.environ.get("CACHE_KEY_NAME_ENV"),
+    "data_dir": os.environ.get("DATA_DIR_ENV"),
+    "max_scripts": parse_int("MAX_SCRIPTS_ENV"),
+    "min_cluster_size": parse_int("MIN_CLUSTER_ENV"),
+    "require_ast_preview": os.environ.get("REQUIRE_AST_ENV") == "1",
+    "dtw": {
+        "max_distance": parse_float("DTW_MAX_ENV"),
+        "lb_ratio": parse_float("DTW_LB_ENV"),
+        "pruning_enabled": os.environ.get("DTW_PRUNING_ENV") != "0"
+    },
+}
+
+with open(os.environ["CACHE_CONFIG_PATH"], "w", encoding="utf-8") as fh:
+    json.dump(config, fh, indent=2)
+    fh.write("\n")
+PY
+
+    if [ $? -eq 0 ]; then
+        echo "[INFO] Cache metadata saved to: $config_path"
+    else
+        echo "[WARN] Failed to write cache metadata at $config_path"
+    fi
+}
+
 USE_CACHE="${USE_CACHE:-0}"
 DTW_PRUNING_ENABLED="${DTW_PRUNING_ENABLED:-1}"
 DTW_MAX_DISTANCE="${DTW_MAX_DISTANCE:-$DEFAULT_DTW_MAX_DISTANCE}"
 DTW_LB_RATIO="${DTW_LB_RATIO:-$DEFAULT_DTW_LB_RATIO}"
 REQUIRE_AST_PREVIEW="${REQUIRE_AST_PREVIEW:-0}"
 TIMESTAMP_FILTER="${TIMESTAMP_FILTER:-}"
+CACHE_KEY_OVERRIDE="${CACHE_KEY:-}"
 MAX_SCRIPTS_OVERRIDE=""
 MIN_CLUSTER_OVERRIDE=""
 TIMESTAMP_FILTERS=()
@@ -138,6 +222,14 @@ while [[ $# -gt 0 ]]; do
             MIN_CLUSTER_OVERRIDE="$2"
             shift 2
             ;;
+        --cache-key)
+            if [ -z "${2:-}" ]; then
+                echo "--cache-key requires a value (e.g., 20251112-1)"
+                exit 1
+            fi
+            CACHE_KEY_OVERRIDE="$2"
+            shift 2
+            ;;
         --timestamp)
             shift
             consumed_any=0
@@ -189,6 +281,10 @@ if [ "$#" -gt 0 ]; then
     POSITIONAL_ARGS+=("$@")
 fi
 
+if [ "$#" -gt 0 ]; then
+    POSITIONAL_ARGS+=("$@")
+fi
+
 if [ "$USE_CACHE" -eq 1 ] && [ ${#TIMESTAMP_FILTERS[@]} -eq 0 ]; then
     echo "--use-cache requires at least one timestamp via --timestamp or TIMESTAMP_FILTER."
     exit 1
@@ -230,10 +326,47 @@ else
 fi
 
 CACHE_ROOT="cache"
-RUN_CACHE_DIR="$CACHE_ROOT/$TIMESTAMP_KEY"
+mkdir -p "$CACHE_ROOT"
+
+if [ -z "$CACHE_KEY_OVERRIDE" ]; then
+    if [ "$USE_CACHE" -eq 1 ]; then
+        echo "--use-cache requires --cache-key (e.g., --cache-key ${TIMESTAMP_KEY}-1)."
+        exit 1
+    fi
+    suffix=1
+    while true; do
+        candidate="${TIMESTAMP_KEY}-${suffix}"
+        if [ ! -e "$CACHE_ROOT/$candidate" ]; then
+            CACHE_DIR_KEY="$candidate"
+            break
+        fi
+        suffix=$((suffix + 1))
+    done
+else
+    CACHE_DIR_KEY="$CACHE_KEY_OVERRIDE"
+fi
+
+RUN_CACHE_DIR="$CACHE_ROOT/$CACHE_DIR_KEY"
 OUTPUT="$RUN_CACHE_DIR/$DEFAULT_OUTPUT"
 REPORT_FILE="$RUN_CACHE_DIR/cluster_report.json"
-mkdir -p "$RUN_CACHE_DIR"
+
+if [ "$USE_CACHE" -eq 1 ]; then
+    if [ ! -d "$RUN_CACHE_DIR" ]; then
+        echo "Cache directory $RUN_CACHE_DIR not found (use --cache-key to pick an existing run)."
+        exit 1
+    fi
+else
+    if [ -e "$RUN_CACHE_DIR" ] && [ -z "$CACHE_KEY_OVERRIDE" ]; then
+        # Should not happen because we auto-selected unused suffix, but guard anyway.
+        echo "Cache directory $RUN_CACHE_DIR already exists. Choose a different --cache-key."
+        exit 1
+    fi
+    if [ -n "$CACHE_KEY_OVERRIDE" ] && [ -e "$RUN_CACHE_DIR" ]; then
+        echo "Cache directory $RUN_CACHE_DIR already exists. Choose a new --cache-key or remove it."
+        exit 1
+    fi
+    mkdir -p "$RUN_CACHE_DIR"
+fi
 
 echo "Configuration:"
 echo "  Data directory: $DATA_DIR"
@@ -260,7 +393,8 @@ if [ ${#TIMESTAMP_FILTERS[@]} -gt 0 ]; then
 else
     echo "  Timestamp filter: none"
 fi
-echo "  Cache key: $TIMESTAMP_KEY"
+echo "  Timestamp key: $TIMESTAMP_KEY"
+echo "  Cache key: $CACHE_DIR_KEY"
 echo "  Cache directory: $RUN_CACHE_DIR"
 echo "  JOBLIB_TEMP_FOLDER: $JOBLIB_TEMP_FOLDER"
 echo ""
@@ -415,6 +549,10 @@ if [ $? -ne 0 ]; then
     exit 1
 fi
 echo "[OK] Cluster report saved to: $REPORT_FILE"
+
+if [ "$USE_CACHE" -eq 0 ]; then
+    write_cache_metadata
+fi
 
 # Step 7: Launch visualization
 echo ""
