@@ -213,6 +213,7 @@ class ScriptClusterer:
         max_sequence_length=2000,
         require_ast_preview=False,
         allowed_timestamps=None,
+        min_suspicious_events=0,
     ):
         self.experiment_data_dir = Path(experiment_data_dir)
         self.traces = []
@@ -233,6 +234,7 @@ class ScriptClusterer:
         self.embedding_dim = 0
         self.semantic_cost_enabled = False
         self.require_ast_preview = require_ast_preview
+        self.min_suspicious_events = max(0, int(min_suspicious_events or 0))
         if allowed_timestamps:
             self.allowed_timestamp_list = list(allowed_timestamps)
             self.allowed_timestamps = set(self.allowed_timestamp_list)
@@ -1209,6 +1211,7 @@ class ScriptClusterer:
             print(f"Timestamp filter enabled: {', '.join(self.allowed_timestamp_list)}")
 
         filtered_without_ast = 0
+        filtered_low_suspicious_events = 0
         skipped_timestamps = 0
 
         for byscripts_file in tqdm(byscripts_files, desc="Processing files"):
@@ -1312,6 +1315,13 @@ class ScriptClusterer:
                         filtered_without_ast += 1
                         continue
 
+                    if (
+                        self.min_suspicious_events > 0
+                        and suspicious_events < self.min_suspicious_events
+                    ):
+                        filtered_low_suspicious_events += 1
+                        continue
+
                     self.traces.append(trace)
 
                     # Limit for testing
@@ -1328,6 +1338,11 @@ class ScriptClusterer:
         print(f"\nExtracted {len(self.traces)} script traces")
         if self.require_ast_preview:
             print(f"Filtered out {filtered_without_ast} scripts without AST previews.")
+        if self.min_suspicious_events > 0:
+            print(
+                f"Filtered out {filtered_low_suspicious_events} scripts with "
+                f"fewer than {self.min_suspicious_events} suspicious events."
+            )
         if self.allowed_timestamps is not None:
             print(f"Skipped {skipped_timestamps} files outside the timestamp filter.")
 
@@ -2157,6 +2172,8 @@ def main():
                         help='Maximum length for compressed sequences')
     parser.add_argument('--require-ast-preview', action='store_true',
                         help='Filter traces to those with AST previews available')
+    parser.add_argument('--min-suspicious-events', type=int, default=0,
+                        help='Drop traces with fewer than this many suspicious events (0 keeps all)')
     parser.add_argument('--timestamp', dest='timestamps', action='append',
                         help='Restrict processing to specific timestamp directories (repeatable)')
 
@@ -2175,7 +2192,8 @@ def main():
             args.data_dir,
             max_sequence_length=args.max_seq_length,
             require_ast_preview=args.require_ast_preview,
-            allowed_timestamps=args.timestamps
+            allowed_timestamps=args.timestamps,
+            min_suspicious_events=args.min_suspicious_events,
         )
 
         # Extract traces

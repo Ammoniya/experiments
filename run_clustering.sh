@@ -31,6 +31,8 @@ Options:
                         Skip DTW lower-bound pruning (restores legacy behavior).
   --require-ast-preview
                         Filter to scripts that already have cached AST previews.
+  --min-suspicious-events VALUE
+                        Drop traces with fewer than VALUE suspicious events (0 keeps all).
   --timestamp VALUE    Restrict processing to one or more timestamp directories (repeatable).
   --max-scripts VALUE  Limit how many scripts are processed (use 0 for no limit).
   --min-cluster-size VALUE
@@ -45,6 +47,8 @@ Environment:
   DTW_PRUNING_ENABLED  Set to 0 to disable pruning without editing the script.
   TSNE_FORCE=1         Recompute t-SNE embeddings even if cached ones exist.
   TIMESTAMP_FILTER     Comma/space separated list of timestamps (equivalent to repeating --timestamp).
+  MIN_SUSPICIOUS_EVENTS
+                        Default value for --min-suspicious-events.
   CACHE_KEY            Override cache directory name (needed with --use-cache).
   JOBLIB_TEMP_FOLDER   Writable directory for joblib's temp storage (defaults to .joblib_tmp).
 
@@ -96,6 +100,7 @@ write_cache_metadata() {
     MAX_SCRIPTS_ENV="$MAX_SCRIPTS" \
     MIN_CLUSTER_ENV="$MIN_CLUSTER_SIZE" \
     REQUIRE_AST_ENV="$REQUIRE_AST_PREVIEW" \
+    MIN_SUSPICIOUS_ENV="$MIN_SUSPICIOUS_EVENTS" \
     DTW_MAX_ENV="$DTW_MAX_DISTANCE" \
     DTW_LB_ENV="$DTW_LB_RATIO" \
     DTW_PRUNING_ENV="$DTW_PRUNING_ENABLED" \
@@ -138,6 +143,7 @@ config = {
     "max_scripts": parse_int("MAX_SCRIPTS_ENV"),
     "min_cluster_size": parse_int("MIN_CLUSTER_ENV"),
     "require_ast_preview": os.environ.get("REQUIRE_AST_ENV") == "1",
+    "min_suspicious_events": parse_int("MIN_SUSPICIOUS_ENV"),
     "dtw": {
         "max_distance": parse_float("DTW_MAX_ENV"),
         "lb_ratio": parse_float("DTW_LB_ENV"),
@@ -162,6 +168,7 @@ DTW_PRUNING_ENABLED="${DTW_PRUNING_ENABLED:-1}"
 DTW_MAX_DISTANCE="${DTW_MAX_DISTANCE:-$DEFAULT_DTW_MAX_DISTANCE}"
 DTW_LB_RATIO="${DTW_LB_RATIO:-$DEFAULT_DTW_LB_RATIO}"
 REQUIRE_AST_PREVIEW="${REQUIRE_AST_PREVIEW:-0}"
+MIN_SUSPICIOUS_EVENTS="${MIN_SUSPICIOUS_EVENTS:-0}"
 TIMESTAMP_FILTER="${TIMESTAMP_FILTER:-}"
 CACHE_KEY_OVERRIDE="${CACHE_KEY:-}"
 MAX_SCRIPTS_OVERRIDE=""
@@ -205,6 +212,14 @@ while [[ $# -gt 0 ]]; do
         --require-ast-preview)
             REQUIRE_AST_PREVIEW=1
             shift
+            ;;
+        --min-suspicious-events)
+            if [ -z "${2:-}" ]; then
+                echo "--min-suspicious-events requires a numeric value"
+                exit 1
+            fi
+            MIN_SUSPICIOUS_EVENTS="$2"
+            shift 2
             ;;
         --max-scripts)
             if [ -z "${2:-}" ]; then
@@ -388,6 +403,7 @@ if [ "$REQUIRE_AST_PREVIEW" -eq 1 ]; then
 else
     echo "  AST preview filter: disabled"
 fi
+echo "  Min suspicious events: $MIN_SUSPICIOUS_EVENTS"
 if [ ${#TIMESTAMP_FILTERS[@]} -gt 0 ]; then
     echo "  Timestamp filter: ${TIMESTAMP_FILTERS[*]}"
 else
@@ -486,6 +502,7 @@ if [ "$USE_CACHE" -eq 0 ]; then
             FILTER_ARGS+=(--timestamp "$ts")
         done
     fi
+    FILTER_ARGS+=(--min-suspicious-events "$MIN_SUSPICIOUS_EVENTS")
 
     python3 cluster_scripts.py \
         --data-dir "$DATA_DIR" \

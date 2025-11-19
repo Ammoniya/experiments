@@ -27,6 +27,7 @@ Example: process at most 250 scripts, require clusters of size ≥10, and only k
 | `--dtw-lb-ratio <value>` | Window ratio for LB_Keogh pruning (default `${DEFAULT_DTW_LB_RATIO}` = 0.05). Set ≤0 to disable via ratio. |
 | `--disable-dtw-pruning` | Skip LB_Keogh pruning entirely (legacy behavior). |
 | `--require-ast-preview` | Filter traces so only scripts with cached AST previews are clustered. |
+| `--min-suspicious-events <value>` | Drop traces that contain fewer than this many suspicious events (default `0`, which keeps everything). |
 | `--timestamp <values>` | Restrict processing to timestamp directories. Accepts space/comma separated values (use quotes or `--` before positional args) and can be repeated. Multiple timestamps are concatenated with `-` to form the timestamp key. |
 | `--max-scripts <value>` | Limit how many scripts are processed (equivalent to the first positional arg, use `0` for “all”). |
 | `--min-cluster-size <value>` | Set HDBSCAN’s minimum cluster size (equivalent to the second positional arg). |
@@ -54,6 +55,7 @@ These mirror the CLI switches and can be exported inline for a single invocation
 | `DTW_LB_RATIO=<value>` | Default for `--dtw-lb-ratio`. |
 | `DTW_PRUNING_ENABLED=0` | Equivalent to `--disable-dtw-pruning`. |
 | `REQUIRE_AST_PREVIEW=1` | Enables the AST-preview filter without editing the script. |
+| `MIN_SUSPICIOUS_EVENTS=<value>` | Default minimum suspicious event count passed to `--min-suspicious-events`. |
 | `TSNE_FORCE=1` | Forces recomputation of t-SNE embeddings even if cached data exists. |
 | `SKIP_VIZ=1` | Prepare the Dash app without launching a server. |
 | `TIMESTAMP_FILTER="ts1,ts2"` | Comma/space separated timestamps (equivalent to repeating `--timestamp`, also defines the base timestamp key). |
