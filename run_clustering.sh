@@ -27,6 +27,21 @@ Options:
   --no-cache           Force recomputing clusters even if a cache file exists.
   --dtw-max-distance   Cap DTW distances (enables LB_Keogh pruning in cluster_scripts.py).
   --dtw-lb-ratio       Override the LB_Keogh window ratio passed to cluster_scripts.py.
+  --sequence-mode {auto|dtw|embeddings}
+                        Choose whether to run DTW, Doc2Vec embeddings, or auto-select (default: auto).
+  --skip-dtw           Shortcut for --sequence-mode embeddings (never compute DTW).
+  --force-dtw          Shortcut for --sequence-mode dtw (skip embedding training).
+  --doc2vec-dim VALUE  Override Doc2Vec embedding dimensionality (default: 128).
+  --doc2vec-window VALUE
+                        Doc2Vec window size (default: 5).
+  --doc2vec-min-count VALUE
+                        Minimum token frequency for Doc2Vec vocabulary (default: 1).
+  --doc2vec-epochs VALUE
+                        Doc2Vec training epochs (default: 40).
+  --doc2vec-negative VALUE
+                        Negative sampling parameter for Doc2Vec (default: 5).
+  --doc2vec-workers VALUE
+                        Worker processes for Doc2Vec (default: CPU count - 1).
   --disable-dtw-pruning
                         Skip DTW lower-bound pruning (restores legacy behavior).
   --require-ast-preview
@@ -44,6 +59,13 @@ Environment:
   USE_CACHE=1          Equivalent to providing --use-cache.
   DTW_MAX_DISTANCE     Default value for --dtw-max-distance.
   DTW_LB_RATIO         Default value for --dtw-lb-ratio.
+  SEQUENCE_MODE        Default sequence mode (auto, dtw, embeddings).
+  DOC2VEC_DIM          Default Doc2Vec dimensionality (default: 128).
+  DOC2VEC_WINDOW       Default Doc2Vec window size (default: 5).
+  DOC2VEC_MIN_COUNT    Default Doc2Vec vocabulary min-count (default: 1).
+  DOC2VEC_EPOCHS       Default Doc2Vec epochs (default: 40).
+  DOC2VEC_NEGATIVE     Default Doc2Vec negative sampling parameter (default: 5).
+  DOC2VEC_WORKERS      Default Doc2Vec worker count (blank uses CPU count - 1).
   DTW_PRUNING_ENABLED  Set to 0 to disable pruning without editing the script.
   TSNE_FORCE=1         Recompute t-SNE embeddings even if cached ones exist.
   TIMESTAMP_FILTER     Comma/space separated list of timestamps (equivalent to repeating --timestamp).
@@ -104,6 +126,13 @@ write_cache_metadata() {
     DTW_MAX_ENV="$DTW_MAX_DISTANCE" \
     DTW_LB_ENV="$DTW_LB_RATIO" \
     DTW_PRUNING_ENV="$DTW_PRUNING_ENABLED" \
+    SEQUENCE_MODE_ENV="$SEQUENCE_MODE" \
+    DOC2VEC_DIM_ENV="$DOC2VEC_DIM" \
+    DOC2VEC_WINDOW_ENV="$DOC2VEC_WINDOW" \
+    DOC2VEC_MIN_COUNT_ENV="$DOC2VEC_MIN_COUNT" \
+    DOC2VEC_EPOCHS_ENV="$DOC2VEC_EPOCHS" \
+    DOC2VEC_NEGATIVE_ENV="$DOC2VEC_NEGATIVE" \
+    DOC2VEC_WORKERS_ENV="$DOC2VEC_WORKERS" \
     DATA_DIR_ENV="$DATA_DIR" \
     python3 <<'PY'
 import json
@@ -149,6 +178,15 @@ config = {
         "lb_ratio": parse_float("DTW_LB_ENV"),
         "pruning_enabled": os.environ.get("DTW_PRUNING_ENV") != "0"
     },
+    "sequence_mode": os.environ.get("SEQUENCE_MODE_ENV"),
+    "doc2vec": {
+        "dim": parse_int("DOC2VEC_DIM_ENV"),
+        "window": parse_int("DOC2VEC_WINDOW_ENV"),
+        "min_count": parse_int("DOC2VEC_MIN_COUNT_ENV"),
+        "epochs": parse_int("DOC2VEC_EPOCHS_ENV"),
+        "negative": parse_int("DOC2VEC_NEGATIVE_ENV"),
+        "workers": parse_int("DOC2VEC_WORKERS_ENV"),
+    },
 }
 
 with open(os.environ["CACHE_CONFIG_PATH"], "w", encoding="utf-8") as fh:
@@ -167,6 +205,13 @@ USE_CACHE="${USE_CACHE:-0}"
 DTW_PRUNING_ENABLED="${DTW_PRUNING_ENABLED:-1}"
 DTW_MAX_DISTANCE="${DTW_MAX_DISTANCE:-$DEFAULT_DTW_MAX_DISTANCE}"
 DTW_LB_RATIO="${DTW_LB_RATIO:-$DEFAULT_DTW_LB_RATIO}"
+SEQUENCE_MODE="${SEQUENCE_MODE:-auto}"
+DOC2VEC_DIM="${DOC2VEC_DIM:-128}"
+DOC2VEC_WINDOW="${DOC2VEC_WINDOW:-5}"
+DOC2VEC_MIN_COUNT="${DOC2VEC_MIN_COUNT:-1}"
+DOC2VEC_EPOCHS="${DOC2VEC_EPOCHS:-40}"
+DOC2VEC_NEGATIVE="${DOC2VEC_NEGATIVE:-5}"
+DOC2VEC_WORKERS="${DOC2VEC_WORKERS:-}"
 REQUIRE_AST_PREVIEW="${REQUIRE_AST_PREVIEW:-0}"
 MIN_SUSPICIOUS_EVENTS="${MIN_SUSPICIOUS_EVENTS:-0}"
 TIMESTAMP_FILTER="${TIMESTAMP_FILTER:-}"
@@ -203,6 +248,78 @@ while [[ $# -gt 0 ]]; do
                 exit 1
             fi
             DTW_LB_RATIO="$2"
+            shift 2
+            ;;
+        --sequence-mode)
+            if [ -z "${2:-}" ]; then
+                echo "--sequence-mode requires one of: auto, dtw, embeddings"
+                exit 1
+            fi
+            case "$2" in
+                auto|dtw|embeddings)
+                    SEQUENCE_MODE="$2"
+                    ;;
+                *)
+                    echo "--sequence-mode must be one of: auto, dtw, embeddings"
+                    exit 1
+                    ;;
+            esac
+            shift 2
+            ;;
+        --skip-dtw)
+            SEQUENCE_MODE="embeddings"
+            shift
+            ;;
+        --force-dtw)
+            SEQUENCE_MODE="dtw"
+            shift
+            ;;
+        --doc2vec-dim)
+            if [ -z "${2:-}" ]; then
+                echo "--doc2vec-dim requires a numeric value"
+                exit 1
+            fi
+            DOC2VEC_DIM="$2"
+            shift 2
+            ;;
+        --doc2vec-window)
+            if [ -z "${2:-}" ]; then
+                echo "--doc2vec-window requires a numeric value"
+                exit 1
+            fi
+            DOC2VEC_WINDOW="$2"
+            shift 2
+            ;;
+        --doc2vec-min-count)
+            if [ -z "${2:-}" ]; then
+                echo "--doc2vec-min-count requires a numeric value"
+                exit 1
+            fi
+            DOC2VEC_MIN_COUNT="$2"
+            shift 2
+            ;;
+        --doc2vec-epochs)
+            if [ -z "${2:-}" ]; then
+                echo "--doc2vec-epochs requires a numeric value"
+                exit 1
+            fi
+            DOC2VEC_EPOCHS="$2"
+            shift 2
+            ;;
+        --doc2vec-negative)
+            if [ -z "${2:-}" ]; then
+                echo "--doc2vec-negative requires a numeric value"
+                exit 1
+            fi
+            DOC2VEC_NEGATIVE="$2"
+            shift 2
+            ;;
+        --doc2vec-workers)
+            if [ -z "${2:-}" ]; then
+                echo "--doc2vec-workers requires a numeric value (use 0 for auto)"
+                exit 1
+            fi
+            DOC2VEC_WORKERS="$2"
             shift 2
             ;;
         --disable-dtw-pruning)
@@ -393,6 +510,11 @@ if [ "$DTW_PRUNING_ENABLED" -eq 1 ]; then
 else
     echo "  DTW pruning: disabled"
 fi
+echo "  Sequence mode: $SEQUENCE_MODE"
+if [ "$SEQUENCE_MODE" != "dtw" ]; then
+    WORKER_LABEL="${DOC2VEC_WORKERS:-auto}"
+    echo "  Doc2Vec: dim=$DOC2VEC_DIM window=$DOC2VEC_WINDOW epochs=$DOC2VEC_EPOCHS min_count=$DOC2VEC_MIN_COUNT negative=$DOC2VEC_NEGATIVE workers=$WORKER_LABEL"
+fi
 if [ "$USE_CACHE" -eq 1 ]; then
     echo "  Cache mode: enabled (expecting $OUTPUT)"
 else
@@ -504,13 +626,19 @@ if [ "$USE_CACHE" -eq 0 ]; then
     fi
     FILTER_ARGS+=(--min-suspicious-events "$MIN_SUSPICIOUS_EVENTS")
 
+    EMBED_ARGS=(--sequence-mode "$SEQUENCE_MODE" --doc2vec-dim "$DOC2VEC_DIM" --doc2vec-window "$DOC2VEC_WINDOW" --doc2vec-min-count "$DOC2VEC_MIN_COUNT" --doc2vec-epochs "$DOC2VEC_EPOCHS" --doc2vec-negative "$DOC2VEC_NEGATIVE")
+    if [ -n "$DOC2VEC_WORKERS" ]; then
+        EMBED_ARGS+=(--doc2vec-workers "$DOC2VEC_WORKERS")
+    fi
+
     python3 cluster_scripts.py \
         --data-dir "$DATA_DIR" \
         --max-scripts "$MAX_SCRIPTS" \
         --min-cluster-size "$MIN_CLUSTER_SIZE" \
         --output "$OUTPUT" \
         "${DTW_ARGS[@]}" \
-        "${FILTER_ARGS[@]}"
+        "${FILTER_ARGS[@]}" \
+        "${EMBED_ARGS[@]}"
 
     if [ $? -ne 0 ]; then
         echo "Clustering failed!"

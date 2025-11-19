@@ -23,7 +23,7 @@ from collections import defaultdict, Counter
 from functools import lru_cache
 from urllib.parse import urlparse, parse_qs
 from sklearn.preprocessing import LabelEncoder
-from sklearn.metrics import silhouette_samples
+from sklearn.metrics import silhouette_samples, pairwise_distances
 import hdbscan
 from multiprocessing import Pool, cpu_count
 import pickle
@@ -232,6 +232,8 @@ class ScriptClusterer:
         self.max_sequence_length = max_sequence_length
         self.token_embeddings = {}
         self.embedding_dim = 0
+        self.embedding_matrix = None
+        self.embedding_metadata = {}
         self.semantic_cost_enabled = False
         self.require_ast_preview = require_ast_preview
         self.min_suspicious_events = max(0, int(min_suspicious_events or 0))
@@ -1545,6 +1547,110 @@ class ScriptClusterer:
         print(f"Embedding model trained (dim={self.embedding_dim}, coverage={coverage:.1f}% of tokens).")
         return True
 
+    def compute_sequence_embeddings(
+        self,
+        vector_size=128,
+        window=5,
+        min_count=1,
+        epochs=40,
+        workers=None,
+        negative=5,
+        seed=42,
+    ):
+        """Compute Doc2Vec embeddings for every trace sequence."""
+        print("\n=== Computing Sequence Embeddings (Doc2Vec) ===")
+        documents = []
+        for idx, seq in enumerate(self.sequences):
+            if not seq:
+                continue
+            documents.append((idx, seq))
+
+        if not documents:
+            print("No sequences with events were found; skipping Doc2Vec training.")
+            self.embedding_matrix = None
+            self.embedding_metadata = {}
+            return None
+
+        try:
+            from gensim.models.doc2vec import Doc2Vec, TaggedDocument
+        except ImportError:
+            print("gensim is not installed; cannot compute Doc2Vec embeddings.")
+            self.embedding_matrix = None
+            self.embedding_metadata = {}
+            return None
+
+        try:
+            worker_count = workers or max(1, cpu_count() - 1)
+        except NotImplementedError:
+            worker_count = workers or 1
+
+        worker_count = max(1, worker_count)
+
+        tagged_docs = [TaggedDocument(words=seq, tags=[f"trace_{idx}"]) for idx, seq in documents]
+
+        print(
+            f"Training Doc2Vec on {len(tagged_docs)} documents "
+            f"(vector_size={vector_size}, window={window}, min_count={min_count}, epochs={epochs})"
+        )
+
+        model = Doc2Vec(
+            vector_size=vector_size,
+            window=window,
+            min_count=min_count,
+            workers=worker_count,
+            epochs=epochs,
+            hs=0,
+            negative=negative,
+            dm=1,
+            dm_mean=1,
+            seed=seed,
+        )
+
+        model.build_vocab(tagged_docs)
+        model.train(tagged_docs, total_examples=len(tagged_docs), epochs=model.epochs)
+
+        embedding_matrix = np.zeros((len(self.traces), vector_size), dtype=np.float32)
+        for trace_idx, _ in documents:
+            tag = f"trace_{trace_idx}"
+            embedding_matrix[trace_idx] = model.dv[tag]
+
+        norms = np.linalg.norm(embedding_matrix, axis=1, keepdims=True)
+        norms[norms == 0] = 1.0
+        embedding_matrix = embedding_matrix / norms
+
+        self.embedding_matrix = embedding_matrix
+        self.embedding_metadata = {
+            'method': 'doc2vec',
+            'vector_size': vector_size,
+            'window': window,
+            'min_count': min_count,
+            'epochs': epochs,
+            'negative': negative,
+            'seed': seed,
+            'workers': worker_count,
+        }
+        self.cluster_metadata['embedding_method'] = self.embedding_metadata['method']
+        print(f"Doc2Vec embeddings computed with shape {embedding_matrix.shape}")
+        return self.embedding_matrix
+
+    def compute_embedding_distance_matrix(self, metric='euclidean'):
+        """Derive a pairwise distance matrix from the embedding matrix."""
+        if self.embedding_matrix is None:
+            print("Embedding matrix missing; cannot compute embedding distance matrix.")
+            return None
+
+        print(f"\n=== Computing {metric} distance matrix over embeddings ===")
+        try:
+            distances = pairwise_distances(self.embedding_matrix, metric=metric)
+        except Exception as exc:  # noqa: BLE001
+            print(f"Failed to compute embedding distance matrix: {exc}")
+            return None
+
+        self.distance_matrix = distances.astype(np.float64, copy=False)
+        self.cluster_metadata['distance_source'] = f'embedding_{metric}'
+        print(f"Embedding distance matrix shape: {self.distance_matrix.shape}")
+        return self.distance_matrix
+
     def compute_capability_features(self):
         """Compute normalized capability count vectors for each trace."""
         capabilities = set()
@@ -1762,11 +1868,22 @@ class ScriptClusterer:
         print(f"Mean distance: {self.distance_matrix.mean():.2f}")
         if total_pruned:
             print(f"LB_Keogh pruning skipped {total_pruned} DTW computations (~{(total_pruned / total_pairs) * 100:.1f}% of pairs).")
+        self.cluster_metadata['distance_source'] = 'dtw'
 
     def hdbscan_clustering(self, min_cluster_size=5, min_samples=None, cluster_selection_epsilon=0.0):
-        """Cluster traces using HDBSCAN over the DTW distance matrix."""
-        if self.distance_matrix is None:
-            raise ValueError("Distance matrix has not been computed. Run compute_dtw_distances() first.")
+        """Cluster traces using HDBSCAN over sequence embeddings or DTW distances."""
+        data_source = None
+        metric = None
+        if self.embedding_matrix is not None:
+            print("Using Sequence Embeddings (Vector Space).")
+            data_source = self.embedding_matrix
+            metric = 'euclidean'
+        elif self.distance_matrix is not None:
+            print("Using Precomputed Distance Matrix (Legacy DTW).")
+            data_source = self.distance_matrix
+            metric = 'precomputed'
+        else:
+            raise ValueError("No input data found. Compute embeddings or DTW distances first.")
 
         print("\n=== HDBSCAN Clustering ===")
         print(f"Min cluster size: {min_cluster_size}")
@@ -1775,14 +1892,20 @@ class ScriptClusterer:
         if cluster_selection_epsilon:
             print(f"Cluster selection epsilon: {cluster_selection_epsilon}")
 
+        try:
+            jobs = max(1, cpu_count())
+        except NotImplementedError:
+            jobs = 1
+
         clusterer = hdbscan.HDBSCAN(
-            metric='precomputed',
+            metric=metric,
             min_cluster_size=min_cluster_size,
             min_samples=min_samples,
-            cluster_selection_epsilon=cluster_selection_epsilon
+            cluster_selection_epsilon=cluster_selection_epsilon,
+            core_dist_n_jobs=jobs,
         )
 
-        raw_labels = clusterer.fit_predict(self.distance_matrix)
+        raw_labels = clusterer.fit_predict(data_source)
 
         label_mapping = {}
         next_label = 1
@@ -1799,11 +1922,12 @@ class ScriptClusterer:
         self.clusters = np.array(normalized_labels, dtype=int)
         self.hdbscan_model = clusterer
         self.cluster_metadata = {
-            'method': 'hdbscan',
+            'method': 'hdbscan_vector' if metric == 'euclidean' else 'hdbscan_dtw',
             'min_cluster_size': min_cluster_size,
             'min_samples': min_samples,
             'cluster_selection_epsilon': cluster_selection_epsilon,
-            'raw_labels': raw_labels.tolist()
+            'raw_labels': raw_labels.tolist(),
+            'hdbscan_metric': metric,
         }
         self.linkage_matrix = None  # No dendrogram available for HDBSCAN
 
@@ -1850,8 +1974,8 @@ class ScriptClusterer:
 
     def compute_silhouette_scores(self):
         """Compute and store per-cluster silhouette averages."""
-        if self.distance_matrix is None or self.clusters is None:
-            print("Silhouette computation skipped (missing distance matrix or clusters).")
+        if self.clusters is None:
+            print("Silhouette computation skipped (clusters unavailable).")
             return {}
 
         clustered_mask = self.clusters != -1
@@ -1865,11 +1989,21 @@ class ScriptClusterer:
             print("Silhouette computation skipped (need at least two clusters excluding noise).")
             return {}
 
-        submatrix = self.distance_matrix[np.ix_(valid_indices, valid_indices)]
         labels = self.clusters[clustered_mask]
+        metric = None
+        data = None
+        if self.embedding_matrix is not None:
+            data = self.embedding_matrix[valid_indices]
+            metric = 'euclidean'
+        elif self.distance_matrix is not None:
+            data = self.distance_matrix[np.ix_(valid_indices, valid_indices)]
+            metric = 'precomputed'
+        else:
+            print("Silhouette computation skipped (no embeddings or distance matrix).")
+            return {}
 
         try:
-            sample_scores = silhouette_samples(submatrix, labels, metric='precomputed')
+            sample_scores = silhouette_samples(data, labels, metric=metric)
         except Exception as exc:  # noqa: BLE001
             print(f"Silhouette computation failed: {exc}")
             return {}
@@ -2024,6 +2158,8 @@ class ScriptClusterer:
             'cluster_metadata': self.cluster_metadata,
             'token_embeddings': self.token_embeddings,
             'embedding_dim': self.embedding_dim,
+            'embedding_matrix': self.embedding_matrix,
+            'embedding_metadata': self.embedding_metadata,
             'semantic_cost_enabled': self.semantic_cost_enabled,
             'require_ast_preview': self.require_ast_preview,
             'allowed_timestamps': list(self.allowed_timestamp_list) if self.allowed_timestamp_list else None
@@ -2061,6 +2197,8 @@ class ScriptClusterer:
         clusterer.cluster_metadata = results.get('cluster_metadata', {})
         clusterer.token_embeddings = results.get('token_embeddings', {})
         clusterer.embedding_dim = results.get('embedding_dim', 0)
+        clusterer.embedding_matrix = results.get('embedding_matrix')
+        clusterer.embedding_metadata = results.get('embedding_metadata', {})
         clusterer.semantic_cost_enabled = results.get(
             'semantic_cost_enabled',
             bool(clusterer.token_embeddings)
@@ -2164,6 +2302,24 @@ def main():
                         help='Optional cap for DTW distances; enables early abandoning via lower bounds')
     parser.add_argument('--dtw-lb-ratio', type=float, default=0.1,
                         help='Fraction of the sequence length to use as the LB_Keogh window (<=0 disables)')
+    parser.add_argument('--sequence-mode', choices=['auto', 'dtw', 'embeddings'], default='auto',
+                        help='Select how cluster distances are computed: Doc2Vec embeddings, DTW, or auto fallback.')
+    parser.add_argument('--skip-dtw', action='store_true',
+                        help='Shortcut for --sequence-mode embeddings (skip DTW entirely).')
+    parser.add_argument('--force-dtw', action='store_true',
+                        help='Shortcut for --sequence-mode dtw (disable embedding-based clustering).')
+    parser.add_argument('--doc2vec-dim', type=int, default=128,
+                        help='Dimensionality of Doc2Vec embeddings when sequence-mode uses embeddings.')
+    parser.add_argument('--doc2vec-window', type=int, default=5,
+                        help='Doc2Vec context window size.')
+    parser.add_argument('--doc2vec-min-count', type=int, default=1,
+                        help='Minimum token frequency for Doc2Vec vocabulary.')
+    parser.add_argument('--doc2vec-epochs', type=int, default=40,
+                        help='Training epochs for Doc2Vec.')
+    parser.add_argument('--doc2vec-workers', type=int, default=None,
+                        help='Worker processes for Doc2Vec (defaults to CPU count - 1).')
+    parser.add_argument('--doc2vec-negative', type=int, default=5,
+                        help='Negative sampling parameter for Doc2Vec.')
     parser.add_argument('--output', default='clustering_results.pkl',
                         help='Output file for results')
     parser.add_argument('--load', type=str, default=None,
@@ -2178,6 +2334,11 @@ def main():
                         help='Restrict processing to specific timestamp directories (repeatable)')
 
     args = parser.parse_args()
+    sequence_mode = args.sequence_mode
+    if args.skip_dtw:
+        sequence_mode = 'embeddings'
+    if args.force_dtw:
+        sequence_mode = 'dtw'
 
     if args.load:
         print(f"Loading existing results from {args.load}")
@@ -2208,14 +2369,41 @@ def main():
 
         # Compute capability features
         clusterer.compute_capability_features()
+        clusterer.cluster_metadata['sequence_mode_requested'] = sequence_mode
 
-        # Compute DTW distances
-        clusterer.compute_dtw_distances(
-            max_distance=args.dtw_max_distance,
-            num_workers=args.dtw_workers,
-            chunk_size=args.dtw_chunk_size,
-            lb_window_ratio=args.dtw_lb_ratio
-        )
+        # Compute embeddings if requested
+        embeddings_ready = False
+        if sequence_mode in ('auto', 'embeddings'):
+            embeddings = clusterer.compute_sequence_embeddings(
+                vector_size=args.doc2vec_dim,
+                window=args.doc2vec_window,
+                min_count=args.doc2vec_min_count,
+                epochs=args.doc2vec_epochs,
+                workers=args.doc2vec_workers,
+                negative=args.doc2vec_negative,
+            )
+            embeddings_ready = embeddings is not None
+            if not embeddings_ready and sequence_mode == 'auto':
+                print("Doc2Vec embeddings unavailable; falling back to DTW distances.")
+
+        if sequence_mode == 'embeddings' and not embeddings_ready:
+            print("Embeddings-only mode requested but Doc2Vec training failed. Exiting.")
+            return
+
+        # Compute DTW distances when needed
+        dtw_required = (sequence_mode == 'dtw') or not embeddings_ready
+        if dtw_required:
+            clusterer.compute_dtw_distances(
+                max_distance=args.dtw_max_distance,
+                num_workers=args.dtw_workers,
+                chunk_size=args.dtw_chunk_size,
+                lb_window_ratio=args.dtw_lb_ratio
+            )
+            clusterer.cluster_metadata['sequence_mode'] = 'dtw'
+        else:
+            clusterer.cluster_metadata['sequence_mode'] = 'embeddings'
+            if clusterer.distance_matrix is None:
+                clusterer.compute_embedding_distance_matrix()
 
         # Perform clustering
         min_cluster_size = args.min_cluster_size
