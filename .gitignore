@@ -18,3 +18,4 @@ samples_to_check/
 .joblib_tmp/
 samples/
 cache_summary.html
+cache/
