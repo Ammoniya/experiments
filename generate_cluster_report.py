@@ -329,6 +329,20 @@ def generate_report(results_path: Path, data_dir: Path) -> Dict[str, Any]:
             sum(t.get("num_events", 0) for t in members) / len(members)
             if members else 0
         )
+        vt_counts = []
+        for trace in members:
+            vt_info = trace.get("virustotal")
+            if not vt_info:
+                continue
+            verdict_count = vt_info.get("verdict_count")
+            if verdict_count is None:
+                continue
+            try:
+                vt_counts.append(float(verdict_count))
+            except (TypeError, ValueError):
+                continue
+        vt_trace_count = len(vt_counts)
+        vt_average = sum(vt_counts) / vt_trace_count if vt_trace_count else None
         sil_score = silhouette_lookup.get(cluster_id)
         ast_score = ast_similarity_lookup.get(cluster_id)
         ast_scripts = sum(1 for t in members if t.get("ast_unit_vector"))
@@ -344,6 +358,11 @@ def generate_report(results_path: Path, data_dir: Path) -> Dict[str, Any]:
             "ast_script_count": ast_scripts,
             "ast_total_scripts": ast_total,
             "closest_clusters": neighbor_entries,
+            "virustotal_average_verdict_count": safe_float(vt_average),
+            "virustotal_trace_count": vt_trace_count,
+            "virustotal_trace_coverage": safe_float(
+                (vt_trace_count / len(members)) if members else None
+            ),
             "wordpress_plugins": counter_to_entries(plugin_counts, limit=20),
             "wordpress_themes": counter_to_entries(theme_counts, limit=20),
             "traces": [],
@@ -368,6 +387,8 @@ def generate_report(results_path: Path, data_dir: Path) -> Dict[str, Any]:
                     for label, count in sorted(node_counts.items(), key=lambda kv: kv[1], reverse=True)[:5]
                 ]
 
+            vt_summary = trace.get("virustotal")
+
             trace_entry = {
                 "trace_id": trace.get("trace_id"),
                 "cluster": trace.get("cluster"),
@@ -389,6 +410,9 @@ def generate_report(results_path: Path, data_dir: Path) -> Dict[str, Any]:
                 "event_distribution": summarize_events_counter(trace.get("event_sequence", [])),
                 "wordpress_plugins": trace.get("wordpress_plugins", []),
                 "wordpress_themes": trace.get("wordpress_themes", []),
+                "virustotal": vt_summary or None,
+                "virustotal_verdict": trace.get("virustotal_verdict") or (vt_summary or {}).get("verdict"),
+                "virustotal_verdict_count": trace.get("virustotal_verdict_count") or (vt_summary or {}).get("verdict_count"),
                 "alignment": alignment,
                 "ast_preview": trace.get("ast_preview"),
                 "ast_fingerprint_summary": {
@@ -405,6 +429,59 @@ def generate_report(results_path: Path, data_dir: Path) -> Dict[str, Any]:
     return report
 
 
+def render_text_report(report: Dict[str, Any], max_traces_per_cluster: int = 3) -> str:
+    lines: List[str] = []
+    results_path = report.get("results_path")
+    overall_sil = report.get("overall_silhouette")
+    lines.append("Cluster Report Summary")
+    if results_path:
+        lines.append(f"Results file: {results_path}")
+    lines.append(f"Overall silhouette: {overall_sil:.3f}" if isinstance(overall_sil, (int, float)) and overall_sil is not None else "Overall silhouette: n/a")
+    lines.append("")
+
+    clusters = sorted(report.get("clusters", []), key=lambda c: c.get("cluster_id", 0))
+    for cluster in clusters:
+        cluster_id = cluster.get("cluster_id")
+        count = cluster.get("count", 0)
+        avg_events = cluster.get("average_events_per_script")
+        sil = cluster.get("silhouette")
+        vt_avg = cluster.get("virustotal_average_verdict_count")
+        vt_cov = cluster.get("virustotal_trace_count", 0)
+        vt_line = None
+        if vt_cov:
+            try:
+                vt_line = f"VT avg verdict count: {vt_avg:.2f} ({vt_cov}/{count} traces scanned)"
+            except (TypeError, ValueError):
+                vt_line = f"VT scans: {vt_cov}/{count} traces"
+        elif count:
+            vt_line = "VT scans: 0 traces with data"
+
+        lines.append(f"Cluster {cluster_id} — {count} script(s)")
+        lines.append(f"  Avg events/script: {avg_events:.1f}" if isinstance(avg_events, (int, float)) else "  Avg events/script: n/a")
+        if sil is not None:
+            lines.append(f"  Silhouette: {sil:.3f}")
+        if vt_line:
+            lines.append(f"  {vt_line}")
+
+        traces = cluster.get("traces", [])[:max_traces_per_cluster]
+        for trace in traces:
+            vt = trace.get("virustotal") or {}
+            vt_verdict = vt.get("verdict") or trace.get("virustotal_verdict")
+            vt_count = vt.get("verdict_count")
+            vt_display = vt_verdict or "n/a"
+            if vt_count is not None:
+                vt_display = f"{vt_display} ({vt_count} detections)"
+            script_url = trace.get("script_url") or "unknown URL"
+            lines.append(f"    - {trace.get('trace_id')}: {vt_display} | {script_url}")
+
+        lines.append("")
+
+    if not clusters:
+        lines.append("No clusters available in the report.")
+
+    return "\n".join(lines).rstrip() + "\n"
+
+
 def main():
     parser = argparse.ArgumentParser(description="Generate JSON cluster report with full metadata.")
     parser.add_argument("--results", default="clustering_results.pkl",
@@ -413,6 +490,8 @@ def main():
                         help="Experiment data directory (for script paths)")
     parser.add_argument("--output",
                         help="Optional path to write the report instead of stdout")
+    parser.add_argument("--text-output",
+                        help="Optional path for a plaintext summary (defaults to OUTPUT with .txt suffix)")
     args = parser.parse_args()
 
     results_path = Path(args.results).resolve()
@@ -424,14 +503,32 @@ def main():
         raise SystemExit(f"Data directory not found: {data_dir}")
 
     output_path = Path(args.output).resolve() if args.output else None
+    text_output_path = Path(args.text_output).resolve() if args.text_output else None
     report = generate_report(results_path, data_dir)
+    text_summary = render_text_report(report)
 
     if output_path:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         with output_path.open("w", encoding="utf-8") as fh:
             json.dump(report, fh, indent=2)
             fh.write("\n")
-    else:
+
+        if text_output_path is None:
+            if output_path.suffix:
+                text_output_path = output_path.with_suffix('.txt')
+            else:
+                text_output_path = Path(str(output_path) + '.txt')
+
+    if text_output_path:
+        text_output_path.parent.mkdir(parents=True, exist_ok=True)
+        text_output_path.write_text(text_summary, encoding="utf-8")
+    elif not output_path:
+        json.dump(report, sys.stdout, indent=2)
+        print()
+        print(text_summary, file=sys.stderr)
+        return
+
+    if not output_path:
         json.dump(report, sys.stdout, indent=2)
         print()
 

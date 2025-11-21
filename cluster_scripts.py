@@ -243,6 +243,7 @@ class ScriptClusterer:
         else:
             self.allowed_timestamp_list = None
             self.allowed_timestamps = None
+        self._ast_cache = {}
 
     def timestamp_matches(self, directory_name):
         """Return True if the given timestamp directory passes the filter."""
@@ -275,8 +276,8 @@ class ScriptClusterer:
         return {}
 
     @staticmethod
-    def should_filter_event(event):
-        arg = ScriptClusterer.get_event_argument(event)
+    def should_filter_event(event, arg=None):
+        arg = arg if arg is not None else ScriptClusterer.get_event_argument(event)
         event_type = arg.get('type') or event.get('eventType')
 
         if event_type in NOISE_EVENT_TYPES:
@@ -752,9 +753,9 @@ class ScriptClusterer:
 
         return "|".join(parts)
 
-    def parse_event(self, event, trace_context=None):
+    def parse_event(self, event, trace_context=None, arg=None):
         """Return token, base type, capability and target metadata for an event."""
-        arg = self.get_event_argument(event)
+        arg = arg if arg is not None else self.get_event_argument(event)
         base_type = arg.get('type') or event.get('eventType')
         if not base_type:
             return None
@@ -1114,19 +1115,30 @@ class ScriptClusterer:
             return None
 
         script_hash = script_metadata.get('hash')
-        candidates = []
-        if script_hash:
-            candidates.append(ast_dir / f"ast_{script_hash}.json")
-
         file_name = script_metadata.get('file_name')
         js_path = None
         if file_name:
             js_path = self.experiment_data_dir / url_hash / timestamp / 'loaded_js' / file_name
 
+        cache_key = None
+        if script_hash:
+            cache_key = ('hash', script_hash)
+        elif file_name:
+            cache_key = ('path', url_hash, timestamp, file_name)
+
+        if cache_key and cache_key in self._ast_cache:
+            return self._ast_cache[cache_key]
+
+        candidates = []
+        if script_hash:
+            candidates.append(ast_dir / f"ast_{script_hash}.json")
+
         if not script_hash and js_path and js_path.exists():
             computed_hash = self.compute_script_hash(js_path)
             if computed_hash:
+                script_hash = computed_hash
                 candidates.append(ast_dir / f"ast_{computed_hash}.json")
+                cache_key = ('hash', computed_hash)
 
         for candidate in candidates:
             if candidate.exists():
@@ -1134,10 +1146,16 @@ class ScriptClusterer:
                     with open(candidate, 'r', encoding='utf-8') as f:
                         data = json.load(f)
                         data['__cache_path'] = str(candidate)
+                        if cache_key:
+                            self._ast_cache[cache_key] = data
                         return data
                 except Exception as exc:  # noqa: BLE001
                     print(f"Error reading AST fingerprint at {candidate}: {exc}")
+                    if cache_key:
+                        self._ast_cache[cache_key] = None
                     return None
+        if cache_key:
+            self._ast_cache[cache_key] = None
         return None
 
     @staticmethod
@@ -1202,6 +1220,80 @@ class ScriptClusterer:
             'url': data.get('url')
         }
 
+    @staticmethod
+    def normalize_severity_label(level):
+        if not level:
+            return None
+        label = level.replace('SEVERITY_', '').replace('_', ' ')
+        label = label.strip()
+        if not label:
+            return None
+        return label.title()
+
+    @staticmethod
+    def compose_virustotal_verdict(malicious_count, suspicious_count, severity_level):
+        malicious = int(malicious_count or 0)
+        suspicious = int(suspicious_count or 0)
+
+        if malicious > 0:
+            return "Malicious"
+        if suspicious > 0:
+            return "Suspicious"
+
+        normalized = ScriptClusterer.normalize_severity_label(severity_level)
+        if normalized:
+            return normalized
+        return "Clean"
+
+    def load_virustotal_report(self, url_hash, timestamp):
+        """Load VirusTotal report summary for the crawled URL if available."""
+        vt_path = self.experiment_data_dir / url_hash / timestamp / 'virustotal_report.json'
+        if not vt_path.exists():
+            return None
+
+        try:
+            with open(vt_path, 'r') as f:
+                raw_report = json.load(f)
+        except Exception as exc:
+            print(f"Error reading VirusTotal report from {vt_path}: {exc}")
+            return None
+
+        report_blob = raw_report.get('report') or {}
+        attributes = report_blob.get('attributes') or {}
+        stats = attributes.get('last_analysis_stats') or {}
+        malicious = int(stats.get('malicious') or 0)
+        suspicious = int(stats.get('suspicious') or 0)
+        harmless = int(stats.get('harmless') or 0)
+        undetected = int(stats.get('undetected') or 0)
+        timeout = int(stats.get('timeout') or 0)
+        total_scanners = malicious + suspicious + harmless + undetected + timeout
+
+        severity = attributes.get('threat_severity') or {}
+        severity_level = severity.get('threat_severity_level')
+        verdict = self.compose_virustotal_verdict(malicious, suspicious, severity_level)
+
+        summary = {
+            'url': raw_report.get('url') or attributes.get('url'),
+            'report_id': report_blob.get('id'),
+            'report_link': (report_blob.get('links') or {}).get('self'),
+            'verdict': verdict,
+            'verdict_count': malicious + suspicious,
+            'malicious_count': malicious,
+            'suspicious_count': suspicious,
+            'total_scanners': total_scanners if total_scanners > 0 else None,
+            'scan_date': attributes.get('last_analysis_date'),
+            'threat_severity_level': severity_level,
+            'threat_severity_label': self.normalize_severity_label(severity_level),
+            'threat_severity_note': severity.get('level_description'),
+        }
+
+        # Keep explicit zeros so downstream consumers can distinguish "no detections".
+        summary['verdict_count'] = int(summary['verdict_count'])
+        summary['malicious_count'] = malicious
+        summary['suspicious_count'] = suspicious
+
+        return summary
+
     def extract_traces(self, max_scripts=None):
         """Extract event traces from all byscripts.json files"""
         print("\n=== Extracting Event Traces ===")
@@ -1230,6 +1322,7 @@ class ScriptClusterer:
                 # Load script metadata
                 metadata_map = self.load_script_metadata(url_hash, timestamp)
                 fingerprint = self.load_fingerprint(url_hash, timestamp)
+                virustotal_summary = self.load_virustotal_report(url_hash, timestamp)
 
                 # Load events
                 with open(byscripts_file, 'r') as f:
@@ -1255,10 +1348,11 @@ class ScriptClusterer:
                     trace_context = {'script_domain': script_domain}
 
                     for event in events:
-                        if self.should_filter_event(event):
+                        arg = self.get_event_argument(event)
+                        if self.should_filter_event(event, arg):
                             continue
 
-                        parsed = self.parse_event(event, trace_context)
+                        parsed = self.parse_event(event, trace_context, arg)
                         if not parsed:
                             continue
 
@@ -1283,6 +1377,8 @@ class ScriptClusterer:
                     # Get metadata
 
                     # Create trace record
+                    vt_details = virustotal_summary if virustotal_summary else None
+
                     trace = {
                         'trace_id': f"{url_hash}_{timestamp}_{script_id}",
                         'url_hash': url_hash,
@@ -1308,7 +1404,11 @@ class ScriptClusterer:
                         'wordpress_version': fingerprint.get('wordpress_version'),
                         'wordpress_plugins': fingerprint.get('plugins', []),
                         'wordpress_themes': fingerprint.get('themes', []),
-                        'page_url': fingerprint.get('url')
+                        'page_url': fingerprint.get('url'),
+                        # VirusTotal metadata
+                        'virustotal': vt_details,
+                        'virustotal_verdict': (vt_details or {}).get('verdict'),
+                        'virustotal_verdict_count': (vt_details or {}).get('verdict_count')
                     }
 
                     self.attach_ast_metadata(trace, url_hash, timestamp, script_metadata)
@@ -1970,6 +2070,22 @@ class ScriptClusterer:
                 ) or "n/a"
                 print(f"  Cluster {cluster_id}: {preview}")
 
+        vt_stats = self.compute_cluster_virustotal_stats()
+        if vt_stats:
+            print("\nVirusTotal verdict averages:")
+            for cluster_id in sorted(vt_stats):
+                entry = vt_stats[cluster_id]
+                avg = entry.get('average_verdict_count')
+                scanned = entry.get('trace_count_with_verdict', 0)
+                total = entry.get('total_traces', scanned)
+                if avg is None:
+                    print(f"  Cluster {cluster_id}: {scanned}/{total} traces with VirusTotal coverage")
+                else:
+                    print(
+                        f"  Cluster {cluster_id}: {avg:.2f} avg detections "
+                        f"({scanned}/{total} traces scanned)"
+                    )
+
         return self.clusters
 
     def compute_silhouette_scores(self):
@@ -2088,6 +2204,47 @@ class ScriptClusterer:
         if neighbors:
             self.cluster_metadata['cluster_neighbors'] = neighbors
         return neighbors
+
+    def compute_cluster_virustotal_stats(self):
+        """Aggregate VirusTotal verdict counts per cluster for reporting."""
+        if self.clusters is None:
+            return {}
+
+        totals = defaultdict(float)
+        coverage = defaultdict(int)
+        cluster_sizes = Counter()
+
+        for trace in self.traces:
+            cluster_id = trace.get('cluster')
+            if cluster_id in (None, -1):
+                continue
+            cluster_id = int(cluster_id)
+            cluster_sizes[cluster_id] += 1
+
+            vt_summary = trace.get('virustotal')
+            if not vt_summary:
+                continue
+            verdict_count = vt_summary.get('verdict_count')
+            if verdict_count is None:
+                continue
+            totals[cluster_id] += float(verdict_count)
+            coverage[cluster_id] += 1
+
+        if not coverage:
+            return {}
+
+        stats = {}
+        for cluster_id, scanned in coverage.items():
+            total_traces = cluster_sizes.get(cluster_id, scanned)
+            avg = totals[cluster_id] / scanned if scanned else None
+            stats[cluster_id] = {
+                'average_verdict_count': avg,
+                'trace_count_with_verdict': scanned,
+                'total_traces': total_traces,
+            }
+
+        self.cluster_metadata['virustotal_cluster_stats'] = stats
+        return stats
 
     def analyze_clusters(self):
         """Analyze cluster characteristics"""

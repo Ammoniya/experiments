@@ -18,6 +18,7 @@ import shutil
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlparse
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 # Keywords that often indicate heavy obfuscation or dynamic execution.
@@ -328,6 +329,187 @@ def write_network_report(copied_traces: Sequence[Tuple[Dict, str]], cluster_dir:
         json.dump({"scripts": report_entries}, fh, indent=2)
 
 
+def split_wordpress_asset_label(label: str) -> Tuple[str, str]:
+    label = (label or "").strip()
+    if not label:
+        return "unknown", "unspecified"
+    if label.endswith(")") and "(" in label:
+        base, version = label[:-1].rsplit("(", 1)
+        base = base.strip() or "unknown"
+        version = version.strip() or "unspecified"
+        return base, version
+    return label, "unspecified"
+
+
+def aggregate_wordpress_assets(entries: Optional[Sequence[Dict]]) -> List[Dict]:
+    grouped: Dict[str, Dict[str, int]] = {}
+    if not entries:
+        return []
+    for entry in entries:
+        label = entry.get("label")
+        count_value = entry.get("count")
+        try:
+            count = int(count_value)
+        except (TypeError, ValueError):
+            continue
+        if count <= 0:
+            continue
+        name, version = split_wordpress_asset_label(label)
+        bucket = grouped.setdefault(name, {})
+        bucket[version] = bucket.get(version, 0) + count
+    aggregated: List[Dict] = []
+    for name, versions in grouped.items():
+        total = sum(versions.values())
+        sorted_versions = sorted(versions.items(), key=lambda item: (-item[1], item[0]))
+        aggregated.append(
+            {
+                "name": name,
+                "total": total,
+                "versions": [{"label": version, "count": count} for version, count in sorted_versions],
+            }
+        )
+    aggregated.sort(key=lambda item: (-item["total"], item["name"]))
+    return aggregated
+
+
+def format_wordpress_distribution_text(distribution: Sequence[Dict]) -> str:
+    if not distribution:
+        return "None"
+    parts: List[str] = []
+    for asset in distribution:
+        version_bits = ", ".join(f"{version['label']}: {version['count']}" for version in asset.get("versions", []))
+        if version_bits:
+            parts.append(f"{asset.get('name', 'unknown')} ({version_bits})")
+        else:
+            parts.append(str(asset.get("name", "unknown")))
+    return "; ".join(parts)
+
+
+def format_float_value(value: Optional[float], precision: int = 3) -> str:
+    if value is None:
+        return "N/A"
+    return f"{float(value):.{precision}f}"
+
+
+def format_nearest_clusters_text(nearest: Sequence[Dict]) -> str:
+    if not nearest:
+        return "None"
+    parts: List[str] = []
+    for entry in nearest:
+        cluster_id = entry.get("cluster_id")
+        distance = entry.get("distance")
+        if distance is None:
+            parts.append(str(cluster_id))
+        else:
+            parts.append(f"{cluster_id} ({float(distance):.4f})")
+    return "; ".join(parts)
+
+
+def extract_unique_urls_and_domains(traces: Sequence[Dict]) -> Tuple[List[str], List[str]]:
+    url_set = set()
+    for trace in traces:
+        url = (trace.get("script_url") or "").strip()
+        if url:
+            url_set.add(url)
+    unique_urls = sorted(url_set)
+    domain_set = set()
+    for url in unique_urls:
+        parsed = urlparse(url)
+        domain = parsed.netloc or parsed.path.split("/")[0]
+        domain = domain.strip().lower()
+        if domain:
+            domain_set.add(domain)
+    unique_domains = sorted(domain_set)
+    return unique_urls, unique_domains
+
+
+def build_cluster_summary(cache_key: str, cluster: Dict, traces: Sequence[Dict]) -> Dict[str, object]:
+    plugin_distribution = aggregate_wordpress_assets(cluster.get("wordpress_plugins"))
+    theme_distribution = aggregate_wordpress_assets(cluster.get("wordpress_themes"))
+
+    def average(field: str) -> Optional[float]:
+        values: List[float] = []
+        for trace in traces:
+            value = trace.get(field)
+            if value is None:
+                continue
+            try:
+                values.append(float(value))
+            except (TypeError, ValueError):
+                continue
+        if not values:
+            return None
+        return sum(values) / len(values)
+
+    unique_urls, unique_domains = extract_unique_urls_and_domains(traces)
+    avg_trace_length = cluster.get("average_events_per_script")
+    if avg_trace_length is None:
+        avg_trace_length = average("num_events")
+
+    avg_virustotal = cluster.get("virustotal_average_verdict_count")
+    if avg_virustotal is None:
+        avg_virustotal = average("virustotal_verdict_count")
+
+    summary = {
+        "cache_key": cache_key,
+        "cluster_id": cluster.get("cluster_id"),
+        "members": int(cluster.get("count") or len(traces)),
+        "avg_silhouette": cluster.get("silhouette"),
+        "avg_ast_similarity": cluster.get("ast_similarity"),
+        "avg_virustotal_detections": avg_virustotal,
+        "avg_suspicious_events_per_trace": average("suspicious_event_count"),
+        "avg_trace_length": avg_trace_length,
+        "nearest_clusters": [
+            {"cluster_id": entry.get("cluster_id"), "distance": entry.get("distance")}
+            for entry in cluster.get("closest_clusters") or []
+        ],
+        "wordpress_plugins": plugin_distribution,
+        "wordpress_themes": theme_distribution,
+        "unique_url_count": len(unique_urls),
+        "unique_urls": unique_urls,
+        "unique_domain_count": len(unique_domains),
+        "unique_domains": unique_domains,
+    }
+    return summary
+
+
+def format_cluster_summary_text(summary: Dict[str, object]) -> str:
+    lines = [
+        f"Cache Key: {summary.get('cache_key')}",
+        f"Cluster ID: {summary.get('cluster_id')}",
+        f"Members: {summary.get('members')}",
+        f"Avg Silhouette: {format_float_value(summary.get('avg_silhouette'))}",
+        f"Avg AST Similarity: {format_float_value(summary.get('avg_ast_similarity'))}",
+        f"Avg VirusTotal Detections: {format_float_value(summary.get('avg_virustotal_detections'))}",
+        f"Avg Suspicious Events per Trace: {format_float_value(summary.get('avg_suspicious_events_per_trace'))}",
+        f"Avg Trace Length: {format_float_value(summary.get('avg_trace_length'))}",
+        f"Nearest Clusters: {format_nearest_clusters_text(summary.get('nearest_clusters') or [])}",
+        "",
+        "WordPress Plugin Distribution:",
+        f"  {format_wordpress_distribution_text(summary.get('wordpress_plugins') or [])}",
+        "",
+        "WordPress Theme Distribution:",
+        f"  {format_wordpress_distribution_text(summary.get('wordpress_themes') or [])}",
+        "",
+        f"Unique Script URLs ({summary.get('unique_url_count', 0)}):",
+    ]
+    for url in summary.get("unique_urls") or []:
+        lines.append(f"  - {url}")
+    lines.append("")
+    lines.append(f"Unique Domains ({summary.get('unique_domain_count', 0)}):")
+    for domain in summary.get("unique_domains") or []:
+        lines.append(f"  - {domain}")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def write_cluster_summary_files(summary: Dict[str, object], cluster_dir: Path) -> None:
+    with (cluster_dir / "cluster_summary.json").open("w", encoding="utf-8") as fh:
+        json.dump(summary, fh, indent=2)
+    with (cluster_dir / "cluster_summary.txt").open("w", encoding="utf-8") as fh:
+        fh.write(format_cluster_summary_text(summary))
+
+
 def should_keep_cluster(trace_scores: Dict[str, float], min_cluster_score: float, min_trace_score: float, min_trace_hits: int) -> bool:
     if not trace_scores:
         return False
@@ -477,6 +659,69 @@ def process_cache(cache_dir: Path, output_root: Path, thresholds: argparse.Names
     return total_clusters, total_files
 
 
+def extract_specific_cluster(cache_dir: Path, cluster_id: int, output_root: Path) -> None:
+    report_path = cache_dir / "cluster_report.json"
+    if not report_path.exists():
+        raise SystemExit(f"No cluster_report.json found in {cache_dir}")
+
+    cache_key = find_cache_key(cache_dir)
+    report = load_json(report_path)
+    str_cluster_id = str(cluster_id)
+    cluster = None
+    for entry in report.get("clusters", []):
+        if str(entry.get("cluster_id")) == str_cluster_id:
+            cluster = entry
+            break
+    if not cluster:
+        raise SystemExit(f"Cluster {cluster_id} not found in {cache_dir}")
+
+    traces = cluster.get("traces") or []
+    if not traces:
+        raise SystemExit(f"Cluster {cluster_id} in {cache_dir} does not contain any traces.")
+
+    trace_scores = {trace["trace_id"]: compute_trace_score(trace) for trace in traces}
+    cluster_score = sum(trace_scores.values()) / len(trace_scores) if trace_scores else 0.0
+    suspicious_call_count = sum(int(trace.get("suspicious_event_count") or 0) for trace in traces)
+
+    selection = ClusterSelection(
+        cache_key=cache_key,
+        cache_dir=cache_dir,
+        cluster_id=str_cluster_id,
+        cluster_score=cluster_score,
+        suspicious_call_count=suspicious_call_count,
+        selected_traces=list(traces),
+        trace_scores=trace_scores,
+    )
+
+    cluster_dir = output_root / cache_key / f"cluster-{str_cluster_id}"
+    cluster_dir.mkdir(parents=True, exist_ok=True)
+
+    copied_traces: List[Tuple[Dict, str]] = []
+    output_files: Dict[str, str] = {}
+    copied_count = 0
+    for idx, trace in enumerate(selection.selected_traces, 1):
+        ok, filename = copy_trace(trace, cluster_dir, idx)
+        if ok:
+            copied_count += 1
+            copied_traces.append((trace, filename))
+            output_files[trace["trace_id"]] = filename
+        else:
+            print(f"[WARN] {filename}", file=sys.stderr)
+
+    if copied_count:
+        write_manifest(selection, selection.trace_scores, cluster_dir, output_files)
+        write_network_report(copied_traces, cluster_dir)
+
+    summary = build_cluster_summary(cache_key, cluster, traces)
+    summary["copied_file_count"] = copied_count
+    write_cluster_summary_files(summary, cluster_dir)
+
+    print(
+        "[INFO] Extracted "
+        f"{copied_count} scripts for cache {cache_key} cluster {str_cluster_id} -> {cluster_dir}"
+    )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Extract suspicious JavaScript samples from cache reports.")
     parser.add_argument("--cache-root", default="cache", help="Directory containing cache subfolders.")
@@ -509,13 +754,32 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="Discard traces with fewer than this many suspicious (malicious API) events before sampling (default: %(default)s).",
     )
+    parser.add_argument(
+        "--cluster-cache",
+        help="Path to a specific cache directory (e.g., cache/all-3) to extract a single cluster.",
+    )
+    parser.add_argument(
+        "--cluster-id",
+        type=int,
+        help="Cluster ID to extract when using --cluster-cache.",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    cache_root = Path(args.cache_root)
     output_root = Path(args.output_root)
+
+    if args.cluster_cache:
+        if args.cluster_id is None:
+            raise SystemExit("--cluster-id must be provided when --cluster-cache is used.")
+        cache_dir = Path(args.cluster_cache)
+        if not cache_dir.exists():
+            raise SystemExit(f"Cluster cache not found: {cache_dir}")
+        extract_specific_cluster(cache_dir, args.cluster_id, output_root)
+        return
+
+    cache_root = Path(args.cache_root)
     if not cache_root.exists():
         raise SystemExit(f"Cache root not found: {cache_root}")
 

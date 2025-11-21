@@ -104,6 +104,7 @@ class ClusterVisualizer:
         self.clusters = results['clusters']
         self.event_types = results.get('event_types', list(self.encoder.classes_))
         self.cluster_metadata = results.get('cluster_metadata', {}) or {}
+        self.virustotal_cluster_stats = self.cluster_metadata.get('virustotal_cluster_stats', {}) or {}
         self.silhouette_lookup = self.cluster_metadata.get('silhouette_per_cluster', {}) or {}
         self.overall_silhouette = self.cluster_metadata.get('silhouette_overall')
         self.ast_similarity_lookup = self.cluster_metadata.get('ast_similarity', {}) or {}
@@ -218,6 +219,7 @@ class ClusterVisualizer:
                 domain = 'unknown'
 
             coords = self.embeddings[i] if self.embeddings is not None else np.zeros(3)
+            vt_info = trace.get('virustotal') or {}
 
             data.append({
                 'trace_id': trace['trace_id'],
@@ -237,6 +239,10 @@ class ClusterVisualizer:
                 'timestamp': trace['timestamp'],
                 'script_id': trace['script_id'],
                 'file_name': trace.get('file_name', 'unknown'),
+                'virustotal_verdict': vt_info.get('verdict'),
+                'virustotal_verdict_count': vt_info.get('verdict_count'),
+                'virustotal_report_link': vt_info.get('report_link'),
+                'virustotal_total_scanners': vt_info.get('total_scanners'),
                 'index': i  # For easy lookup
             })
 
@@ -503,6 +509,11 @@ class ClusterVisualizer:
             return None
         return self.silhouette_lookup.get(cluster_id)
 
+    def get_cluster_virustotal_stats(self, cluster_id):
+        if cluster_id in (None, -1):
+            return {}
+        return self.virustotal_cluster_stats.get(int(cluster_id)) or {}
+
     def compute_subsequence_alignment(self, trace):
         """Return cached alignment results for a trace."""
         trace_id = trace.get('trace_id')
@@ -640,6 +651,42 @@ class ClusterVisualizer:
             """Update scatter plot"""
             df = self.df.copy()
 
+            def format_hover_vt(row):
+                verdict = row.get('virustotal_verdict')
+                vt_count = row.get('virustotal_verdict_count')
+                vt_total = row.get('virustotal_total_scanners')
+
+                verdict_label = verdict if isinstance(verdict, str) and verdict else None
+
+                def _to_number(value):
+                    if value is None or (isinstance(value, float) and np.isnan(value)):
+                        return None
+                    try:
+                        num = float(value)
+                    except (TypeError, ValueError):
+                        return value
+                    if num.is_integer():
+                        return int(num)
+                    return num
+
+                count_value = _to_number(vt_count)
+                total_value = _to_number(vt_total)
+
+                if verdict_label is None and count_value is None and total_value is None:
+                    return "VirusTotal: n/a"
+
+                detection_text = None
+                if count_value is not None and total_value is not None:
+                    detection_text = f"{count_value}/{total_value} detections"
+                elif count_value is not None:
+                    detection_text = f"{count_value} detections"
+                elif total_value is not None:
+                    detection_text = f"0/{total_value} detections"
+
+                if detection_text:
+                    return f"VirusTotal: {verdict_label or 'n/a'} ({detection_text})"
+                return f"VirusTotal: {verdict_label or 'n/a'}"
+
             # Create hover text
             df['hover_text'] = df.apply(
                 lambda row: f"<b>{row['domain']}</b><br>" +
@@ -648,6 +695,7 @@ class ClusterVisualizer:
                              if pd.notna(row['cluster_similarity']) else "") +
                             (f"AST similarity: {row['ast_similarity']:.3f}<br>"
                              if pd.notna(row['ast_similarity']) else "AST similarity: n/a<br>") +
+                            f"{format_hover_vt(row)}<br>" +
                             f"Events: {row['num_events']}<br>" +
                             f"Script ID: {row['script_id']}<br>" +
                             f"URL: {row['script_url'][:60]}...",
@@ -819,6 +867,70 @@ class ClusterVisualizer:
                 )
             else:
                 nearest_clusters_display = 'n/a'
+            vt_summary = trace.get('virustotal') or {}
+            vt_verdict = vt_summary.get('verdict') or trace.get('virustotal_verdict')
+            vt_count = vt_summary.get('verdict_count')
+            if vt_count is None:
+                vt_count = trace.get('virustotal_verdict_count')
+            vt_total = vt_summary.get('total_scanners')
+            vt_link = vt_summary.get('report_link')
+            cluster_vt_stats = self.get_cluster_virustotal_stats(trace.get('cluster'))
+
+            def render_vt_cell():
+                has_data = any([
+                    vt_summary,
+                    vt_verdict,
+                    vt_count is not None,
+                    vt_total is not None,
+                ])
+                if not has_data:
+                    return html.Span("Unavailable", style={'fontStyle': 'italic', 'color': '#6b7280'})
+
+                parts = []
+                if vt_verdict:
+                    parts.append(vt_verdict)
+
+                def _fmt_count(count_value):
+                    if count_value is None or (isinstance(count_value, float) and np.isnan(count_value)):
+                        return None
+                    try:
+                        numeric = float(count_value)
+                    except (TypeError, ValueError):
+                        return count_value
+                    if numeric.is_integer():
+                        return int(numeric)
+                    return round(numeric, 2)
+
+                count_value = _fmt_count(vt_count)
+                total_value = _fmt_count(vt_total)
+
+                if count_value is not None and total_value is not None:
+                    parts.append(f"{count_value}/{total_value} detections")
+                elif count_value is not None:
+                    parts.append(f"{count_value} detections")
+                elif total_value is not None:
+                    parts.append(f"0/{total_value} detections")
+
+                detail = html.Span(' | '.join(parts), style={'fontFamily': 'monospace'}) if parts else html.Span('n/a')
+                if vt_link:
+                    return html.Span([
+                        detail,
+                        html.Br(),
+                        html.A('View on VirusTotal', href=vt_link, target='_blank', rel='noopener noreferrer')
+                    ])
+                return detail
+
+            def render_cluster_vt_cell():
+                if not cluster_vt_stats:
+                    return html.Span('No VirusTotal coverage', style={'fontStyle': 'italic', 'color': '#6b7280'})
+                avg = cluster_vt_stats.get('average_verdict_count')
+                scanned = cluster_vt_stats.get('trace_count_with_verdict', 0)
+                total = cluster_vt_stats.get('total_traces', scanned)
+                if avg is None:
+                    text = f"{scanned}/{total} traces scanned"
+                else:
+                    text = f"{avg:.2f} avg detections ({scanned}/{total} traces scanned)"
+                return html.Span(text, style={'fontFamily': 'monospace'})
 
             def render_wp_items(items, empty_text):
                 grouped = defaultdict(Counter)
@@ -896,6 +1008,8 @@ class ClusterVisualizer:
                             html.Tr([html.Td(html.Strong("Page URL:")), html.Td(trace.get('page_url', 'Unavailable'), style={'wordBreak': 'break-all'})]),
                             html.Tr([html.Td(html.Strong("Script SHA256:")), html.Td(code_hash or "Unavailable")]),
                             html.Tr([html.Td(html.Strong("Script Path:")), html.Td(code_location or "Unavailable", style={'wordBreak': 'break-all'})]),
+                            html.Tr([html.Td(html.Strong("VirusTotal Verdict:")), html.Td(render_vt_cell())]),
+                            html.Tr([html.Td(html.Strong("Cluster Avg VT Detections:")), html.Td(render_cluster_vt_cell())]),
                             html.Tr([html.Td(html.Strong("Timestamp:")), html.Td(trace['timestamp'])]),
                         ], style={'width': '100%', 'marginTop': 10})
                     ], style={'marginBottom': 20}),
