@@ -157,6 +157,8 @@ WORDFENCE_HEADERS = {
 
 SECTION_SEPARATOR = "-" * 72
 TEXT_WIDTH = 100
+WORDFENCE_SCAN_BATCH = 9
+WORDFENCE_BATCH_DELAY = 600  # 10 minutes between batches to avoid rate limits
 
 
 def ensure_tqdm_available() -> None:
@@ -188,17 +190,34 @@ def slugify_label(label: str) -> str:
     return slug
 
 
+def expand_slug_variations(slug: str, min_tokens: int = 3) -> set[str]:
+    tokens = [token for token in slug.split("-") if token]
+    if not tokens:
+        return set()
+    variations: set[str] = {slug}
+    for idx in range(len(tokens)):
+        suffix_tokens = tokens[idx:]
+        if len(suffix_tokens) < min_tokens:
+            continue
+        alias = "-".join(suffix_tokens)
+        variations.add(alias)
+    return variations
+
+
 def load_vulnerability_map(path: Path | None) -> dict[str, Any]:
     if path is None or not path.exists():
         return {}
     with path.open("r", encoding="utf-8") as fh:
         raw = json.load(fh)
-    normalized: dict[str, Any] = {}
-    for key, entries in raw.items():
+    normalized: dict[str, list[dict[str, Any]]] = {}
+
+    def _ingest_legacy_entries(key: str, entries: Sequence[Mapping[str, Any]]) -> None:
         if not entries:
-            continue
-        slug = key.strip().lower()
-        processed = []
+            return
+        slug = slugify_label(str(key))
+        if not slug:
+            return
+        processed: list[dict[str, Any]] = []
         for entry in entries:
             if not entry:
                 continue
@@ -210,7 +229,50 @@ def load_vulnerability_map(path: Path | None) -> dict[str, Any]:
                 "constraint_groups": wrap_constraint_groups(constraints),
             })
         if processed:
-            normalized[slug] = processed
+            for variant in expand_slug_variations(slug, min_tokens=1):
+                normalized.setdefault(variant, []).extend(processed)
+
+    def _ingest_wordfence_payload(entry: Mapping[str, Any]) -> None:
+        if not entry:
+            return
+        uuid = entry.get("id")
+        title = entry.get("title") or ""
+        cve = entry.get("cve")
+        for software in entry.get("software") or []:
+            slug_candidates = {
+                slugify_label(str(value))
+                for value in (software.get("slug"), software.get("name"))
+                if value
+            }
+            slug_candidates.discard("")
+            if not slug_candidates:
+                continue
+            groups = convert_wordfence_constraints(software.get("affected_versions") or {})
+            variations: set[str] = set()
+            for slug in slug_candidates:
+                variations.update(expand_slug_variations(slug))
+            for slug in variations:
+                normalized.setdefault(slug, []).append({
+                    "cve": cve,
+                    "wordfence_uuid": uuid,
+                    "title": title,
+                    "constraint_groups": groups,
+                })
+
+    if isinstance(raw, list):
+        for entry in raw:
+            if isinstance(entry, Mapping):
+                _ingest_wordfence_payload(entry)
+        return normalized
+
+    if isinstance(raw, Mapping):
+        for key, value in raw.items():
+            if isinstance(value, list):
+                _ingest_legacy_entries(str(key), value)
+            elif isinstance(value, Mapping):
+                _ingest_wordfence_payload(value)
+        return normalized
+
     return normalized
 
 
@@ -225,6 +287,27 @@ def parse_constraints(text: str) -> list[dict[str, str]]:
 
 def wrap_constraint_groups(constraints: list[dict[str, str]]) -> list[list[dict[str, str]]]:
     return [constraints] if constraints else []
+
+
+def describe_constraint_groups(groups: list[list[dict[str, Any]]]) -> str:
+    if not groups:
+        return "all versions"
+    labels: list[str] = []
+    for group in groups:
+        parts: list[str] = []
+        for constraint in group or []:
+            kind = constraint.get("type")
+            if kind == "range":
+                low = constraint.get("low") or "*"
+                high = constraint.get("high") or "*"
+                parts.append(f"{low} - {high}")
+            elif kind == "op":
+                op = constraint.get("op") or "="
+                version = constraint.get("version") or "*"
+                parts.append(f"{op} {version}")
+        if parts:
+            labels.append(" and ".join(parts))
+    return " or ".join(labels) if labels else "all versions"
 
 
 def _split_version(value: str) -> list[Any]:
@@ -341,27 +424,35 @@ def format_vuln_identifier(vuln: Mapping[str, Any]) -> str:
 
 
 def summarize_vulnerabilities(entries: list[dict[str, object]], vuln_map: Mapping[str, Any]) -> str:
-    segments: list[str] = []
+    summary: dict[str, dict[str, dict[str, Any]]] = {}
     for entry in entries:
-        slug = slugify_label(str(entry["base"]))
+        base = str(entry["base"])
+        slug = slugify_label(base)
         vulns = vuln_map.get(slug)
         if not vulns:
             continue
-        versions: dict[str | None, float] = entry.get("versions", {})  # type: ignore[assignment]
-        for version in sorted((str(v) for v in versions.keys() if v), key=version_sort_key):
-            matched = [
-                vuln for vuln in vulns
-                if version_satisfies(version, vuln.get("constraint_groups") or [])
-            ]
-            if not matched:
-                continue
-            ids = ", ".join(format_vuln_identifier(v) for v in matched)
-            segments.append(f"{entry['base']} {version}: {ids}")
-        if None in versions:
-            unconstrained = [vuln for vuln in vulns if not vuln.get("constraint_groups")]
-            if unconstrained:
-                ids = ", ".join(format_vuln_identifier(v) for v in unconstrained)
-                segments.append(f"{entry['base']}: {ids}")
+        versions_map: dict[str | None, float] = entry.get("versions", {})  # type: ignore[assignment]
+        base_records = summary.setdefault(base, {})
+        for vuln in vulns:
+            identifier = format_vuln_identifier(vuln)
+            record = base_records.setdefault(identifier, {
+                "note": describe_constraint_groups(vuln.get("constraint_groups") or []),
+                "matched": set(),
+            })
+            matched_versions = {
+                str(version)
+                for version in versions_map.keys()
+                if version and version_satisfies(str(version), vuln.get("constraint_groups") or [])
+            }
+            record["matched"].update(matched_versions)
+    segments: list[str] = []
+    for base in sorted(summary):
+        records = summary[base]
+        for identifier in sorted(records):
+            details = records[identifier]
+            matched = sorted(details["matched"], key=version_sort_key)
+            match_note = f" [matched versions: {', '.join(matched)}]" if matched else ""
+            segments.append(f"{base}: {identifier} ({details['note']}){match_note}")
     return "; ".join(segments)
 
 
@@ -374,9 +465,11 @@ def verify_with_wordfence(
     if not slugs:
         return results
     ensure_tqdm_available()
-    iterator = progress_iter(list(slugs), "Verifying CVEs")
-    for idx, slug in enumerate(iterator):
-        if idx > 0 and delay > 0:
+    slug_list = list(slugs)
+    total_slugs = len(slug_list)
+    iterator = progress_iter(slug_list, "Verifying CVEs")
+    for idx, slug in enumerate(iterator, start=1):
+        if idx > 1 and delay > 0:
             time.sleep(delay)
         try:
             entries = fetch_wordfence_entries(slug, timeout)
@@ -410,6 +503,12 @@ def verify_with_wordfence(
             continue
         if entries:
             results[slug] = entries
+        if idx % WORDFENCE_SCAN_BATCH == 0 and idx < total_slugs:
+            print(
+                f"Processed {idx} Wordfence scans, sleeping {WORDFENCE_BATCH_DELAY}s to respect rate limits...",
+                file=sys.stderr,
+            )
+            time.sleep(WORDFENCE_BATCH_DELAY)
     return results
 
 
@@ -581,6 +680,20 @@ def write_text_report(rows: Sequence[Mapping], output_path: Path) -> None:
     output_path.write_text(report, encoding="utf-8")
 
 
+def render_reports(
+    rows: Sequence[Mapping],
+    output_path: Path,
+    text_path: Path,
+    enable_text: bool,
+    stage_label: str,
+) -> None:
+    write_csv(rows, output_path)
+    if enable_text:
+        write_text_report(rows, text_path)
+        print(f"{stage_label}: saved text report to {text_path}")
+    print(f"{stage_label}: saved {len(rows)} clusters to {output_path}")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Scan a cached cluster report and export key metrics to CSV."
@@ -597,8 +710,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--vuln-data",
-        default="plugin_vulnerabilities.json",
-        help="Path to plugin/theme vulnerability JSON (default: plugin_vulnerabilities.json).",
+        default="wordfence_db.json",
+        help="Path to plugin/theme vulnerability JSON (default: wordfence_db.json).",
     )
     parser.add_argument(
         "--wordfence-cache",
@@ -644,25 +757,47 @@ def main() -> None:
     clusters = list(load_report(cache_root, args.cluster_key))
     active_slugs = sorted(collect_active_slugs(clusters))
     vuln_map = load_vulnerability_map(vuln_path)
+    local_vuln_slugs = set(vuln_map.keys())
+    local_matches = [slug for slug in active_slugs if slug in local_vuln_slugs]
     wordfence_cache = load_wordfence_cache(cache_path)
     for slug, entries in wordfence_cache.items():
         vuln_map[slug] = entries
-    if not args.no_verify_cves:
-        slugs_to_verify = [slug for slug in active_slugs if slug not in wordfence_cache]
-        fetched = verify_with_wordfence(slugs_to_verify, args.wordfence_delay, args.wordfence_timeout)
-        if fetched:
-            for slug, entries in fetched.items():
-                vuln_map[slug] = entries
-                wordfence_cache[slug] = entries
-            save_wordfence_cache(cache_path, wordfence_cache)
+    print(f"Local JSON vulnerabilities cover {len(local_matches)} active plugins.", file=sys.stderr)
     rows = build_rows(clusters, vuln_map)
     output_path = Path(args.output or f"{args.cluster_key}_summary.csv")
-    write_csv(rows, output_path)
-    if not args.no_text_report:
-        text_path = Path(args.text_report)
-        write_text_report(rows, text_path)
-        print(f"Saved text report to {text_path}")
-    print(f"Saved {len(rows)} clusters to {output_path}")
+    text_path = Path(args.text_report)
+    render_reports(
+        rows,
+        output_path,
+        text_path,
+        enable_text=not args.no_text_report,
+        stage_label="Local JSON pass",
+    )
+    if args.no_verify_cves:
+        return
+    slugs_to_verify = [
+        slug for slug in active_slugs
+        if slug not in local_vuln_slugs and slug not in wordfence_cache
+    ]
+    print(
+        f"Wordfence lookups required for {len(slugs_to_verify)} plugins "
+        "(after local DB & cache).",
+        file=sys.stderr,
+    )
+    fetched = verify_with_wordfence(slugs_to_verify, args.wordfence_delay, args.wordfence_timeout)
+    if fetched:
+        for slug, entries in fetched.items():
+            vuln_map[slug] = entries
+            wordfence_cache[slug] = entries
+        save_wordfence_cache(cache_path, wordfence_cache)
+    rows = build_rows(clusters, vuln_map)
+    render_reports(
+        rows,
+        output_path,
+        text_path,
+        enable_text=not args.no_text_report,
+        stage_label="Wordfence pass",
+    )
 
 
 if __name__ == "__main__":
