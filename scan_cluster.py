@@ -159,6 +159,7 @@ SECTION_SEPARATOR = "-" * 72
 TEXT_WIDTH = 100
 WORDFENCE_SCAN_BATCH = 9
 WORDFENCE_BATCH_DELAY = 600  # 10 minutes between batches to avoid rate limits
+DEFAULT_OUTPUT_DIR = Path("samples")
 
 
 def ensure_tqdm_available() -> None:
@@ -694,6 +695,15 @@ def render_reports(
     print(f"{stage_label}: saved {len(rows)} clusters to {output_path}")
 
 
+def resolve_output_path(path_value: str | None, default_name: str) -> Path:
+    """
+    Normalize output destinations so reports land under ``samples`` by default.
+    """
+    path = Path(path_value) if path_value else DEFAULT_OUTPUT_DIR / default_name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Scan a cached cluster report and export key metrics to CSV."
@@ -706,7 +716,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--output",
-        help="Path to write CSV (default: <cluster_key>_summary.csv).",
+        help="Path to write CSV (default: samples/<cluster_key>_summary.csv).",
     )
     parser.add_argument(
         "--vuln-data",
@@ -737,8 +747,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--text-report",
-        default="cluster_summary_report.txt",
-        help="Path to write the text report (default: %(default)s).",
+        help="Path to write the text report (default: samples/cluster_summary_report.txt).",
     )
     parser.add_argument(
         "--no-text-report",
@@ -764,8 +773,8 @@ def main() -> None:
         vuln_map[slug] = entries
     print(f"Local JSON vulnerabilities cover {len(local_matches)} active plugins.", file=sys.stderr)
     rows = build_rows(clusters, vuln_map)
-    output_path = Path(args.output or f"{args.cluster_key}_summary.csv")
-    text_path = Path(args.text_report)
+    output_path = resolve_output_path(args.output, f"{args.cluster_key}_summary.csv")
+    text_path = resolve_output_path(args.text_report, "cluster_summary_report.txt")
     render_reports(
         rows,
         output_path,
