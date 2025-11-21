@@ -18,7 +18,7 @@ import shutil
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 # Keywords that often indicate heavy obfuscation or dynamic execution.
 SUSPICIOUS_EVENT_KEYWORDS = [
@@ -45,10 +45,125 @@ SUSPICIOUS_CAPABILITIES = {
 
 WORDPRESS_PATH_MARKERS = ("wp-content", "wp-includes", "wp-admin", "wp-json", "wordpress")
 
+# Capabilities/event labels that indicate outbound network activity such as
+# XHR/Fetch/WebSocket traffic.
+NETWORK_CAPABILITIES = {
+    "NET_XHR",
+    "NET_FETCH",
+    "NET_WS",
+    "NET_WEBSOCKET",
+    "NET_BEACON",
+    "NET_SOCKET",
+    "NET_WEBRTC",
+    "NET_REQUEST",
+}
+
+NETWORK_EVENT_TYPES = {
+    "fetch request",
+    "xhr request",
+    "networkrequest",
+    "beacon api call",
+}
+
 
 def load_json(path: Path) -> Dict:
     with path.open("r", encoding="utf-8") as fh:
         return json.load(fh)
+
+
+def is_network_event(event_name: str) -> bool:
+    event_type = event_name.split("|", 1)[0].strip().lower()
+    if event_type.startswith("websocket"):
+        return True
+    return event_type in NETWORK_EVENT_TYPES
+
+
+def parse_network_event_details(event_name: str) -> Dict[str, str]:
+    parts = event_name.split("|")
+    metadata: Dict[str, str] = {}
+    for token in parts[1:]:
+        token = token.strip()
+        if not token:
+            continue
+        if "=" in token:
+            key, value = token.split("=", 1)
+        elif ":" in token:
+            key, value = token.split(":", 1)
+        else:
+            continue
+        metadata[key.strip().lower()] = value.strip()
+
+    host = metadata.get("weak_host") or metadata.get("host")
+    domain = metadata.get("weak_domain") or metadata.get("domain")
+    path = metadata.get("weak_path") or metadata.get("path")
+    method = metadata.get("method")
+    resource = metadata.get("resource")
+    initiator = metadata.get("initiator")
+    scheme = metadata.get("scheme")
+    url = metadata.get("url")
+
+    if not url and host:
+        prefix = ""
+        if scheme and not scheme.endswith("://"):
+            prefix = f"{scheme}://"
+        elif scheme:
+            prefix = scheme
+        elif not host.startswith("http"):
+            prefix = "https://"
+        url = f"{prefix}{host}"
+        if path:
+            if not path.startswith("/") and not url.endswith("/"):
+                url += "/"
+            url += path
+    elif not url and path:
+        url = path
+
+    return {
+        "method": method.upper() if isinstance(method, str) else None,
+        "host": host,
+        "path": path,
+        "domain": domain,
+        "resource": resource,
+        "initiator": initiator,
+        "url": url,
+    }
+
+
+def collect_network_request_entries(trace: Dict) -> List[Dict]:
+    entries: List[Dict] = []
+    for event in trace.get("event_distribution") or []:
+        event_name = event.get("event")
+        if not isinstance(event_name, str) or not is_network_event(event_name):
+            continue
+        details = parse_network_event_details(event_name)
+        entry: Dict[str, object] = {
+            "event": event_name,
+            "count": int(event.get("count") or 0),
+        }
+        for key, value in details.items():
+            if value:
+                entry[key] = value
+        entries.append(entry)
+    return entries
+
+
+def get_network_request_entries(trace: Dict) -> List[Dict]:
+    cache_key = "_network_request_entries"
+    if cache_key in trace:
+        cached = trace[cache_key]
+        if isinstance(cached, list):
+            return cached
+    entries = collect_network_request_entries(trace)
+    trace[cache_key] = entries
+    return entries
+
+
+def entry_is_xhr_request(entry: Dict) -> bool:
+    event_name = str(entry.get("event") or "").split("|", 1)[0].strip().lower()
+    if event_name == "xhr request":
+        return True
+    resource = str(entry.get("resource") or "").lower()
+    return event_name == "networkrequest" and resource == "xhr"
 
 
 def compute_trace_score(trace: Dict) -> float:
@@ -163,29 +278,54 @@ def copy_trace(trace: Dict, dest_dir: Path, idx: int) -> Tuple[bool, str]:
     return True, filename
 
 
-def write_manifest(selection: ClusterSelection, trace_scores: Dict[str, float], cluster_dir: Path) -> None:
+def write_manifest(
+    selection: ClusterSelection,
+    trace_scores: Dict[str, float],
+    cluster_dir: Path,
+    output_files: Optional[Dict[str, str]] = None,
+) -> None:
     manifest = {
         "cache_key": selection.cache_key,
         "cluster_id": selection.cluster_id,
         "cluster_score": selection.cluster_score,
         "suspicious_call_count": selection.suspicious_call_count,
         "sample_count": len(selection.selected_traces),
-        "traces": [
-            {
-                "trace_id": trace["trace_id"],
-                "score": trace_scores.get(trace["trace_id"], 0.0),
-                "script_url": trace.get("script_url"),
-                "page_url": trace.get("page_url"),
-                "script_sha256": trace.get("script_sha256"),
-                "script_path": trace.get("script_path"),
-                "suspicious_event_count": trace.get("suspicious_event_count"),
-                "capabilities": trace.get("capability_summary"),
-            }
-            for trace in selection.selected_traces
-        ],
+        "traces": [],
     }
+    for trace in selection.selected_traces:
+        entry = {
+            "trace_id": trace["trace_id"],
+            "score": trace_scores.get(trace["trace_id"], 0.0),
+            "script_url": trace.get("script_url"),
+            "page_url": trace.get("page_url"),
+            "script_sha256": trace.get("script_sha256"),
+            "script_path": trace.get("script_path"),
+            "suspicious_event_count": trace.get("suspicious_event_count"),
+            "capabilities": trace.get("capability_summary"),
+        }
+        if output_files and trace["trace_id"] in output_files:
+            entry["output_file"] = output_files[trace["trace_id"]]
+        manifest["traces"].append(entry)
     with (cluster_dir / "manifest.json").open("w", encoding="utf-8") as fh:
         json.dump(manifest, fh, indent=2)
+
+
+def write_network_report(copied_traces: Sequence[Tuple[Dict, str]], cluster_dir: Path) -> None:
+    report_entries: List[Dict] = []
+    for trace, filename in copied_traces:
+        requests = get_network_request_entries(trace)
+        report_entries.append(
+            {
+                "trace_id": trace["trace_id"],
+                "script_url": trace.get("script_url"),
+                "page_url": trace.get("page_url"),
+                "output_file": filename,
+                "request_count": len(requests),
+                "requests": requests,
+            }
+        )
+    with (cluster_dir / "network_requests.json").open("w", encoding="utf-8") as fh:
+        json.dump({"scripts": report_entries}, fh, indent=2)
 
 
 def should_keep_cluster(trace_scores: Dict[str, float], min_cluster_score: float, min_trace_score: float, min_trace_hits: int) -> bool:
@@ -203,19 +343,41 @@ def is_wordpress_trace(trace: Dict) -> bool:
     return any(marker in combined_path for marker in WORDPRESS_PATH_MARKERS)
 
 
+def trace_has_network_request(trace: Dict) -> bool:
+    return bool(get_network_request_entries(trace))
+
+
+def trace_has_xhr_request(trace: Dict) -> bool:
+    return any(entry_is_xhr_request(entry) for entry in get_network_request_entries(trace))
+
+
 def apply_trace_filters(traces: Sequence[Dict], args: argparse.Namespace) -> List[Dict]:
+    filtered = list(traces)
+    if getattr(args, "require_network_requests", False):
+        filtered = [trace for trace in filtered if trace_has_network_request(trace)]
+    if getattr(args, "require_xhr_request", False):
+        filtered = [trace for trace in filtered if trace_has_xhr_request(trace)]
+
+    min_suspicious_events = max(0, int(getattr(args, "min_suspicious_events", 0) or 0))
+    if min_suspicious_events:
+        filtered = [
+            trace
+            for trace in filtered
+            if int(trace.get("suspicious_event_count") or 0) >= min_suspicious_events
+        ]
+
     wordpress_threshold = getattr(args, "wordpress_malicious_threshold", None)
     if wordpress_threshold is None:
-        return list(traces)
+        return filtered
 
-    filtered: List[Dict] = []
-    for trace in traces:
+    wp_filtered: List[Dict] = []
+    for trace in filtered:
         if not is_wordpress_trace(trace):
             continue
         suspicious_calls = int(trace.get("suspicious_event_count") or 0)
         if suspicious_calls >= wordpress_threshold:
-            filtered.append(trace)
-    return filtered
+            wp_filtered.append(trace)
+    return wp_filtered
 
 
 def iterate_cluster_selections(
@@ -291,14 +453,19 @@ def process_cache(cache_dir: Path, output_root: Path, thresholds: argparse.Names
     for rank, selection in enumerate(ranked_selections, 1):
         cluster_dir = cache_output_dir / f"{rank}-cluster-{selection.cluster_id}"
         copied = 0
+        copied_traces: List[Tuple[Dict, str]] = []
+        output_files: Dict[str, str] = {}
         for idx, trace in enumerate(selection.selected_traces, 1):
             ok, message = copy_trace(trace, cluster_dir, idx)
             if ok:
                 copied += 1
+                copied_traces.append((trace, message))
+                output_files[trace["trace_id"]] = message
             else:
                 print(f"[WARN] {message}", file=sys.stderr)
         if copied:
-            write_manifest(selection, selection.trace_scores, cluster_dir)
+            write_manifest(selection, selection.trace_scores, cluster_dir, output_files)
+            write_network_report(copied_traces, cluster_dir)
             total_clusters += 1
             total_files += copied
             print(
@@ -325,6 +492,22 @@ def parse_args() -> argparse.Namespace:
             "Only copy traces whose script URL/path references WordPress assets "
             "and have at least this many suspicious (malicious API) events."
         ),
+    )
+    parser.add_argument(
+        "--require-network-requests",
+        action="store_true",
+        help="Restrict samples to traces that issue Fetch/XHR/WebSocket/Beacon calls and emit a URL report per cluster.",
+    )
+    parser.add_argument(
+        "--require-xhr-request",
+        action="store_true",
+        help="Only keep traces whose recorded network activity includes an explicit XHR request.",
+    )
+    parser.add_argument(
+        "--min-suspicious-events",
+        type=int,
+        default=0,
+        help="Discard traces with fewer than this many suspicious (malicious API) events before sampling (default: %(default)s).",
     )
     return parser.parse_args()
 
