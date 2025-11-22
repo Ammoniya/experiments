@@ -582,6 +582,31 @@ def save_wordfence_cache(path: Path | None, cache: Mapping[str, Any]) -> None:
     tmp_path.replace(path)
 
 
+def merge_vulnerability_sources(
+    slugs: Sequence[str],
+    local_map: Mapping[str, Any],
+    cache_map: Mapping[str, Any],
+) -> tuple[dict[str, Any], list[str], int, int]:
+    """
+    Combine local DB data with cached responses while tracking coverage sources.
+    """
+    combined: dict[str, Any] = dict(local_map)
+    missing: list[str] = []
+    local_hits = 0
+    cache_hits = 0
+    for slug in slugs:
+        if slug in local_map:
+            local_hits += 1
+            continue
+        cached_entries = cache_map.get(slug)
+        if cached_entries:
+            combined[slug] = cached_entries
+            cache_hits += 1
+            continue
+        missing.append(slug)
+    return combined, missing, local_hits, cache_hits
+
+
 def average_from_traces(traces: Sequence[Mapping], key: str) -> float | None:
     total = 0.0
     count = 0
@@ -736,8 +761,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--wordfence-delay",
         type=float,
-        default=3.0,
-        help="Delay between Wordfence API requests, in seconds (default: 3).",
+        default=10.1,
+        help="Delay between Wordfence API requests, in seconds (default: 10).",
     )
     parser.add_argument(
         "--wordfence-timeout",
@@ -765,48 +790,78 @@ def main() -> None:
     cache_path = Path(args.wordfence_cache) if args.wordfence_cache else None
     clusters = list(load_report(cache_root, args.cluster_key))
     active_slugs = sorted(collect_active_slugs(clusters))
-    vuln_map = load_vulnerability_map(vuln_path)
-    local_vuln_slugs = set(vuln_map.keys())
-    local_matches = [slug for slug in active_slugs if slug in local_vuln_slugs]
+    local_vuln_map = load_vulnerability_map(vuln_path)
     wordfence_cache = load_wordfence_cache(cache_path)
-    for slug, entries in wordfence_cache.items():
-        vuln_map[slug] = entries
-    print(f"Local JSON vulnerabilities cover {len(local_matches)} active plugins.", file=sys.stderr)
-    rows = build_rows(clusters, vuln_map)
     output_path = resolve_output_path(args.output, f"{args.cluster_key}_summary.csv")
     text_path = resolve_output_path(args.text_report, "cluster_summary_report.txt")
-    render_reports(
-        rows,
-        output_path,
-        text_path,
-        enable_text=not args.no_text_report,
-        stage_label="Local JSON pass",
-    )
-    if args.no_verify_cves:
-        return
-    slugs_to_verify = [
-        slug for slug in active_slugs
-        if slug not in local_vuln_slugs and slug not in wordfence_cache
-    ]
+    (
+        vuln_map,
+        unresolved_slugs,
+        local_hits,
+        cache_hits,
+    ) = merge_vulnerability_sources(active_slugs, local_vuln_map, wordfence_cache)
     print(
-        f"Wordfence lookups required for {len(slugs_to_verify)} plugins "
-        "(after local DB & cache).",
+        f"Local JSON vulnerabilities cover {local_hits} active plugins.",
         file=sys.stderr,
     )
-    fetched = verify_with_wordfence(slugs_to_verify, args.wordfence_delay, args.wordfence_timeout)
-    if fetched:
-        for slug, entries in fetched.items():
-            vuln_map[slug] = entries
-            wordfence_cache[slug] = entries
-        save_wordfence_cache(cache_path, wordfence_cache)
+    if cache_hits:
+        print(
+            f"Wordfence cache covered {cache_hits} additional plugins.",
+            file=sys.stderr,
+        )
+    remaining = len(unresolved_slugs)
+    if remaining:
+        print(
+            f"{remaining} plugins still require Wordfence lookups.",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            "All active plugins resolved via local database and cache.",
+            file=sys.stderr,
+        )
+    local_stage_label = "Local DB + cache pass"
+    if args.no_verify_cves or not unresolved_slugs:
+        local_stage_label += " (final)"
     rows = build_rows(clusters, vuln_map)
     render_reports(
         rows,
         output_path,
         text_path,
         enable_text=not args.no_text_report,
-        stage_label="Wordfence pass",
+        stage_label=local_stage_label,
     )
+    performed_remote_scan = False
+    if not args.no_verify_cves and unresolved_slugs:
+        fetched = verify_with_wordfence(
+            unresolved_slugs, args.wordfence_delay, args.wordfence_timeout
+        )
+        performed_remote_scan = True
+        if fetched:
+            for slug, entries in fetched.items():
+                vuln_map[slug] = entries
+                wordfence_cache[slug] = entries
+            save_wordfence_cache(cache_path, wordfence_cache)
+        else:
+            print(
+                "No remote Wordfence data returned for unresolved plugins.",
+                file=sys.stderr,
+            )
+    elif args.no_verify_cves and unresolved_slugs:
+        print(
+            "Skipping remote Wordfence lookups (--no-verify-cves); "
+            "those plugins remain unresolved.",
+            file=sys.stderr,
+        )
+    if performed_remote_scan:
+        rows = build_rows(clusters, vuln_map)
+        render_reports(
+            rows,
+            output_path,
+            text_path,
+            enable_text=not args.no_text_report,
+            stage_label="Wordfence pass",
+        )
 
 
 if __name__ == "__main__":
