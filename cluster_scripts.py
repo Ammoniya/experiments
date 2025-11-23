@@ -16,11 +16,14 @@ import json
 import math
 import re
 import hashlib
+import time
 import numpy as np
 import pandas as pd
+from contextlib import closing
 from pathlib import Path
 from collections import defaultdict, Counter
 from functools import lru_cache
+from typing import Iterator
 from urllib.parse import urlparse, parse_qs
 from sklearn.preprocessing import LabelEncoder
 from sklearn.metrics import silhouette_samples, pairwise_distances
@@ -253,6 +256,60 @@ class ScriptClusterer:
             if directory_name == entry or directory_name.startswith(entry):
                 return True
         return False
+
+    # Codex Addon
+    def stream_byscripts_files(self, log_interval: int = 5000) -> Iterator[Path]:
+        """Yield byscripts.json paths using a streaming directory scan."""
+        base_path = self.experiment_data_dir
+        if not base_path.exists():
+            tqdm.write(f"Experiment data directory does not exist: {base_path}")
+            return
+
+        tqdm.write("Streaming byscripts.json files (optimized for slow storage)...")
+        scanned_url_dirs = 0
+        scanned_timestamp_dirs = 0
+        yielded_files = 0
+        next_log_threshold = log_interval
+        last_log_time = time.perf_counter()
+
+        with closing(os.scandir(base_path)) as url_entries:
+            for url_entry in url_entries:
+                if not url_entry.is_dir(follow_symlinks=False):
+                    continue
+
+                scanned_url_dirs += 1
+
+                try:
+                    with closing(os.scandir(url_entry.path)) as timestamp_entries:
+                        for timestamp_entry in timestamp_entries:
+                            if not timestamp_entry.is_dir(follow_symlinks=False):
+                                continue
+
+                            scanned_timestamp_dirs += 1
+
+                            candidate = Path(timestamp_entry.path) / 'byscripts.json'
+                            if candidate.exists():
+                                yielded_files += 1
+                                yield candidate
+
+                            if scanned_timestamp_dirs >= next_log_threshold:
+                                now = time.perf_counter()
+                                elapsed = now - last_log_time
+                                dirs_per_sec = (log_interval / elapsed) if elapsed else 0
+                                tqdm.write(
+                                    f"  • Visited {scanned_timestamp_dirs:,} timestamp dirs "
+                                    f"(across {scanned_url_dirs:,} url hashes); "
+                                    f"found {yielded_files:,} byscripts.json files (~{dirs_per_sec:,.0f} dirs/s)"
+                                )
+                                last_log_time = now
+                                next_log_threshold += log_interval
+                except (OSError, FileNotFoundError) as err:
+                    tqdm.write(f"Warning: Unable to access {url_entry.path}: {err}")
+
+        tqdm.write(
+            f"Finished scanning {scanned_url_dirs:,} url hashes / "
+            f"{scanned_timestamp_dirs:,} timestamp dirs; found {yielded_files:,} byscripts.json files."
+        )
 
     @staticmethod
     def get_event_argument(event):
@@ -1294,12 +1351,13 @@ class ScriptClusterer:
 
         return summary
 
+    # Codex Addon
     def extract_traces(self, max_scripts=None):
         """Extract event traces from all byscripts.json files"""
         print("\n=== Extracting Event Traces ===")
 
-        byscripts_files = list(self.experiment_data_dir.rglob('byscripts.json'))
-        print(f"Found {len(byscripts_files)} byscripts.json files")
+        print("Scanning for byscripts.json files (streaming traversal)...")
+        byscripts_files_iter = self.stream_byscripts_files()
 
         if self.allowed_timestamp_list:
             print(f"Timestamp filter enabled: {', '.join(self.allowed_timestamp_list)}")
@@ -1307,8 +1365,10 @@ class ScriptClusterer:
         filtered_without_ast = 0
         filtered_low_suspicious_events = 0
         skipped_timestamps = 0
+        processed_byscripts = 0
 
-        for byscripts_file in tqdm(byscripts_files, desc="Processing files"):
+        for byscripts_file in tqdm(byscripts_files_iter, desc="Processing files"):
+            processed_byscripts += 1
             try:
                 # Extract metadata from path
                 parts = byscripts_file.parts
@@ -1437,6 +1497,7 @@ class ScriptClusterer:
                 print(f"Error processing {byscripts_file}: {e}")
                 continue
 
+        print(f"\nProcessed {processed_byscripts} byscripts.json files")
         print(f"\nExtracted {len(self.traces)} script traces")
         if self.require_ast_preview:
             print(f"Filtered out {filtered_without_ast} scripts without AST previews.")

@@ -1,8 +1,10 @@
 import os
 import json
 import shutil
+import time
+from contextlib import closing
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Iterator, Optional
 from urllib.parse import urlparse
 from tqdm import tqdm
 
@@ -78,6 +80,49 @@ def is_url_blacklisted(fingerprint_data: Optional[Dict]) -> bool:
     normalized_host = normalize_host(url) if url else None
     return is_blacklisted_domain(normalized_host)
 
+# Codex Addon
+def stream_timestamp_directories(event_data_path: Path, log_interval: int = 5000) -> Iterator[Path]:
+    """Yield timestamp directories without pre-loading everything into memory."""
+    scanned_url_dirs = 0
+    yield_count = 0
+    next_log_threshold = log_interval
+    last_log_time = time.perf_counter()
+
+    tqdm.write("Streaming timestamp directories (may take a while on slow storage)...")
+
+    with closing(os.scandir(event_data_path)) as url_entries:
+        for url_entry in url_entries:
+            if not url_entry.is_dir(follow_symlinks=False):
+                continue
+
+            scanned_url_dirs += 1
+
+            try:
+                with closing(os.scandir(url_entry.path)) as timestamp_entries:
+                    for timestamp_entry in timestamp_entries:
+                        if not timestamp_entry.is_dir(follow_symlinks=False):
+                            continue
+
+                        yield_count += 1
+                        if yield_count >= next_log_threshold:
+                            now = time.perf_counter()
+                            elapsed = now - last_log_time
+                            dirs_per_sec = (log_interval / elapsed) if elapsed else 0
+                            tqdm.write(
+                                f"  • Scanned {yield_count:,} timestamp dirs across {scanned_url_dirs:,} url hashes "
+                                f"(~{dirs_per_sec:,.0f}/s)"
+                            )
+                            last_log_time = now
+                            next_log_threshold += log_interval
+
+                        yield Path(timestamp_entry.path)
+            except (OSError, FileNotFoundError) as err:
+                tqdm.write(f"Warning: Unable to access {url_entry.path}: {err}")
+
+    tqdm.write(
+        f"Finished scanning {scanned_url_dirs:,} url hash dirs; discovered {yield_count:,} timestamp dirs."
+    )
+
 
 def compute_statistics(event_data_dir: str, copy_to_digest: bool = False) -> Dict[str, int]:
     event_data_path = Path(event_data_dir)
@@ -106,19 +151,9 @@ def compute_statistics(event_data_dir: str, copy_to_digest: bool = False) -> Dic
     }
 
     print("Scanning directory structure...")
-    timestamp_dirs = []
+    timestamp_dirs_iter = stream_timestamp_directories(event_data_path)
 
-    url_hash_dirs = [d for d in event_data_path.iterdir() if d.is_dir()]
-
-    for url_hash_dir in tqdm(url_hash_dirs, desc="Scanning url_hash dirs", unit="dir"):
-        for timestamp_dir in url_hash_dir.iterdir():
-            if timestamp_dir.is_dir():
-                timestamp_dirs.append(timestamp_dir)
-
-    total_dirs = len(timestamp_dirs)
-    print(f"Found {total_dirs} timestamp directories. Processing...")
-
-    for item in tqdm(timestamp_dirs, desc="Processing directories", unit="dir"):
+    for item in tqdm(timestamp_dirs_iter, desc="Processing directories", unit="dir"):
         stats['total_dirs'] += 1
 
         trace_v2_path = item / 'trace_v2.json'
