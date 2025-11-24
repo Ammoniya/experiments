@@ -1,3 +1,18 @@
+./run_clustering.sh \
+  --no-cache \
+  --require-ast-preview \
+  --max-scripts 0 \
+  --min-cluster-size 10 \
+  --force-dtw \
+  --enable-token-tfidf \
+  --min-suspicious-events 2 \
+  --disable-dtw-pruning \
+  --cluster-dtw-max-normalized 800 \
+  --cluster-dtw-min-reference-coverage 0.6 \
+  --distance-cache cache/dtw_matrix_latest.npz
+
+
+
 # Clustering Pipeline Quick Reference
 
 This repository centers around `run_clustering.sh`, which orchestrates the full JavaScript clustering pipeline (trace extraction, DTW, clustering, reporting, and visualization). The script wraps several Python entry points, so invoking it is the easiest way to run end-to-end workflows.

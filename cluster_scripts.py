@@ -23,7 +23,7 @@ from contextlib import closing
 from pathlib import Path
 from collections import defaultdict, Counter
 from functools import lru_cache
-from typing import Iterator
+from typing import Any, Dict, Iterator, List
 from urllib.parse import urlparse, parse_qs
 from sklearn.preprocessing import LabelEncoder
 from sklearn.metrics import silhouette_samples, pairwise_distances
@@ -31,6 +31,11 @@ import hdbscan
 from multiprocessing import Pool, cpu_count
 import pickle
 from tqdm import tqdm
+
+try:
+    from dtaidistance.subsequence.dtw import subsequence_alignment
+except ImportError:  # pragma: no cover - optional dependency
+    subsequence_alignment = None
 
 from cluster_neighbors import compute_cluster_neighbors
 
@@ -210,6 +215,9 @@ WEAK_ATTRIBUTE_PREFIXES = (
 class ScriptClusterer:
     """Cluster JavaScript scripts based on CDP event traces"""
 
+    TOKEN_IDF_LOOKUP = {}
+    TOKEN_IDF_ENABLED = False
+
     def __init__(
         self,
         experiment_data_dir,
@@ -217,6 +225,8 @@ class ScriptClusterer:
         require_ast_preview=False,
         allowed_timestamps=None,
         min_suspicious_events=0,
+        distance_cache_path=None,
+        use_token_tfidf=False,
     ):
         self.experiment_data_dir = Path(experiment_data_dir)
         self.traces = []
@@ -247,6 +257,11 @@ class ScriptClusterer:
             self.allowed_timestamp_list = None
             self.allowed_timestamps = None
         self._ast_cache = {}
+        self.distance_cache_path = (
+            Path(distance_cache_path).expanduser() if distance_cache_path else None
+        )
+        self.use_token_tfidf = bool(use_token_tfidf)
+        self.token_idf = {}
 
     def timestamp_matches(self, directory_name):
         """Return True if the given timestamp directory passes the filter."""
@@ -518,7 +533,14 @@ class ScriptClusterer:
         if not token:
             return 1.0
         base = token.split('|', 1)[0]
-        return 2.0 if base in SUSPICIOUS_EVENTS else 1.0
+        weight = 2.0 if base in SUSPICIOUS_EVENTS else 1.0
+        if ScriptClusterer.TOKEN_IDF_ENABLED:
+            idf = ScriptClusterer.TOKEN_IDF_LOOKUP.get(token)
+            if idf is None:
+                idf = ScriptClusterer.TOKEN_IDF_LOOKUP.get(base)
+            if idf is not None:
+                weight *= float(idf)
+        return weight
 
     @staticmethod
     def is_weak_attribute(part):
@@ -1594,6 +1616,13 @@ class ScriptClusterer:
             lengths = [len(seq) for seq in self.sequences]
             print(f"Compressed sequence lengths - Min: {min(lengths)}, Max: {max(lengths)}, Mean: {np.mean(lengths):.1f}")
 
+        if self.use_token_tfidf:
+            self.compute_token_idf()
+        else:
+            self.token_idf = {}
+            ScriptClusterer.TOKEN_IDF_LOOKUP = {}
+            ScriptClusterer.TOKEN_IDF_ENABLED = False
+
         if self.sequences:
             trained = self.train_token_embeddings()
             if not trained:
@@ -1812,6 +1841,61 @@ class ScriptClusterer:
         print(f"Embedding distance matrix shape: {self.distance_matrix.shape}")
         return self.distance_matrix
 
+    def _load_distance_cache(self):
+        if not self.distance_cache_path:
+            return None
+        path = self.distance_cache_path
+        if not path.exists():
+            return None
+        def _load_npz(allow_pickle):
+            return np.load(path, allow_pickle=allow_pickle)
+
+        try:
+            data = _load_npz(False)
+            distance_matrix = data['distance_matrix']
+            trace_id_array = data['trace_ids']
+        except ValueError as exc:
+            print(f"[WARN] Distance cache {path} requires allow_pickle=True ({exc}); retrying.")
+            try:
+                data = _load_npz(True)
+                distance_matrix = data['distance_matrix']
+                trace_id_array = data['trace_ids']
+            except Exception as exc2:  # noqa: BLE001
+                print(f"[WARN] Failed to load distance cache at {path}: {exc2}")
+                return None
+        except Exception as exc:  # noqa: BLE001
+            print(f"[WARN] Failed to load distance cache at {path}: {exc}")
+            return None
+
+        if distance_matrix is None or trace_id_array is None:
+            print(f"[WARN] Distance cache {path} is missing required keys; ignoring.")
+            return None
+        matrix = np.array(distance_matrix, copy=False)
+        trace_ids = [str(tid) for tid in np.asarray(trace_id_array).tolist()]
+        if matrix.ndim != 2 or matrix.shape[0] != matrix.shape[1]:
+            print(f"[WARN] Distance cache {path} is not square; ignoring.")
+            return None
+        print(f"[info] Loaded DTW distance cache from {path}")
+        return {"distance_matrix": matrix, "trace_ids": trace_ids}
+
+    def _save_distance_cache(self):
+        if not self.distance_cache_path or self.distance_matrix is None:
+            return
+        try:
+            trace_ids = [str(trace.get('trace_id') or f"trace_{idx}") for idx, trace in enumerate(self.traces)]
+            self.distance_cache_path.parent.mkdir(parents=True, exist_ok=True)
+            max_len = max(1, max(len(tid) for tid in trace_ids))
+            dtype = f"<U{max_len}"
+            trace_id_array = np.array(trace_ids, dtype=dtype)
+            np.savez_compressed(
+                self.distance_cache_path,
+                distance_matrix=self.distance_matrix,
+                trace_ids=trace_id_array,
+            )
+            print(f"[info] Saved DTW distance cache to {self.distance_cache_path}")
+        except Exception as exc:  # noqa: BLE001
+            print(f"[WARN] Failed to save distance cache at {self.distance_cache_path}: {exc}")
+
     def compute_capability_features(self):
         """Compute normalized capability count vectors for each trace."""
         capabilities = set()
@@ -1918,11 +2002,33 @@ class ScriptClusterer:
             self.distance_matrix = np.zeros((0, 0), dtype=np.float32)
             return
 
-        self.distance_matrix = np.zeros((n, n), dtype=np.float64)
+        trace_ids = [str(trace.get('trace_id') or f"trace_{idx}") for idx, trace in enumerate(self.traces)]
+        self.distance_matrix = np.full((n, n), np.nan, dtype=np.float64)
         total_pairs = (n * (n - 1)) // 2
         if total_pairs == 0:
             print("Only one sequence detected; DTW matrix is trivial.")
             return
+
+        reused_pairs = 0
+        if self.distance_cache_path:
+            cached = self._load_distance_cache()
+            if cached:
+                prev_lookup = {tid: idx for idx, tid in enumerate(cached['trace_ids'])}
+                cached_matrix = cached['distance_matrix']
+                for i, trace_id in enumerate(trace_ids):
+                    prev_i = prev_lookup.get(trace_id)
+                    if prev_i is None:
+                        continue
+                    for j, other_id in enumerate(trace_ids):
+                        prev_j = prev_lookup.get(other_id)
+                        if prev_j is None:
+                            continue
+                        self.distance_matrix[i, j] = float(cached_matrix[prev_i, prev_j])
+                upper_idx = np.triu_indices(n, k=1)
+                reused_pairs = int(np.isfinite(self.distance_matrix[upper_idx]).sum())
+                if reused_pairs:
+                    reuse_pct = (reused_pairs / max(total_pairs, 1)) * 100.0
+                    print(f"[info] Reused {reused_pairs}/{total_pairs} DTW distances from cache ({reuse_pct:.1f}%).")
 
         if chunk_size is None or chunk_size <= 0:
             chunk_size = 500
@@ -1961,12 +2067,19 @@ class ScriptClusterer:
                 num_workers = 1
 
         num_workers = max(1, num_workers)
-        print(f"Using {num_workers} worker(s) with chunk size {chunk_size} (total pairs: {total_pairs})")
+        remaining_pairs = total_pairs - reused_pairs
+        remaining_pairs = max(0, remaining_pairs)
+        print(
+            f"Using {num_workers} worker(s) with chunk size {chunk_size} "
+            f"(pairs to compute: {remaining_pairs} / {total_pairs})"
+        )
 
         def chunk_generator():
             chunk = []
             for i in range(n):
                 for j in range(i + 1, n):
+                    if np.isfinite(self.distance_matrix[i, j]):
+                        continue
                     chunk.append((i, j))
                     if len(chunk) >= chunk_size:
                         yield chunk
@@ -1975,12 +2088,15 @@ class ScriptClusterer:
                 yield chunk
 
         total_pruned = 0
-
-        if num_workers == 1:
+        if remaining_pairs <= 0:
+            print("[info] No new DTW pairs needed; cached matrix already complete.")
+        elif num_workers == 1:
             print("Multi-processing disabled (worker count = 1).")
-            with tqdm(total=total_pairs, desc="Computing distances") as pbar:
+            with tqdm(total=remaining_pairs, desc="Computing distances") as pbar:
                 for chunk in chunk_generator():
                     for i, j in chunk:
+                        if np.isfinite(self.distance_matrix[i, j]):
+                            continue
                         if lb_enabled:
                             radius = max(
                                 1,
@@ -2015,21 +2131,28 @@ class ScriptClusterer:
                           embedding_lookup,
                           lb_ratio if lb_enabled else 0.0,
                       )) as pool:
-                with tqdm(total=total_pairs, desc="Computing distances") as pbar:
+                with tqdm(total=remaining_pairs, desc="Computing distances") as pbar:
                     for chunk_result, pruned in pool.imap_unordered(_dtw_worker, chunk_generator()):
                         total_pruned += pruned
                         for i, j, dist in chunk_result:
+                            if np.isfinite(self.distance_matrix[i, j]):
+                                continue
                             self.distance_matrix[i, j] = dist
                             self.distance_matrix[j, i] = dist
                         pbar.update(len(chunk_result))
 
         np.fill_diagonal(self.distance_matrix, 0.0)
-        print(f"Distance matrix shape: {self.distance_matrix.shape}")
-        print(f"Distance range: [{self.distance_matrix.min():.2f}, {self.distance_matrix.max():.2f}]")
-        print(f"Mean distance: {self.distance_matrix.mean():.2f}")
+        finite_values = self.distance_matrix[np.isfinite(self.distance_matrix)]
+        if finite_values.size == 0:
+            print("[WARN] Distance matrix contains no finite values.")
+        else:
+            print(f"Distance matrix shape: {self.distance_matrix.shape}")
+            print(f"Distance range: [{finite_values.min():.2f}, {finite_values.max():.2f}]")
+            print(f"Mean distance: {finite_values.mean():.2f}")
         if total_pruned:
             print(f"LB_Keogh pruning skipped {total_pruned} DTW computations (~{(total_pruned / total_pairs) * 100:.1f}% of pairs).")
         self.cluster_metadata['distance_source'] = 'dtw'
+        self._save_distance_cache()
 
     def hdbscan_clustering(self, min_cluster_size=5, min_samples=None, cluster_selection_epsilon=0.0):
         """Cluster traces using HDBSCAN over sequence embeddings or DTW distances."""
@@ -2206,6 +2329,218 @@ class ScriptClusterer:
 
         return per_cluster
 
+    def filter_clusters_by_subsequence(self, max_normalized=None, min_reference_coverage=None, mutate=True):
+        """Run subsequence DTW filtering to drop traces that poorly align with their cluster."""
+        if self.clusters is None:
+            print("DTW cluster filter skipped (clusters unavailable).")
+            return {"filtered_total": 0, "filtered_traces": []}
+        if max_normalized is None and min_reference_coverage is None:
+            return {"filtered_total": 0, "filtered_traces": []}
+        if subsequence_alignment is None:
+            print("DTW cluster filter skipped (dtaidistance>=2.3.0 not installed).")
+            return {"filtered_total": 0, "filtered_traces": []}
+        if not self.encoded_sequences:
+            print("DTW cluster filter skipped (encoded sequences unavailable).")
+            return {"filtered_total": 0, "filtered_traces": []}
+
+        representatives: Dict[int, Dict[str, Any]] = {}
+        for idx, (trace, cluster_id) in enumerate(zip(self.traces, self.clusters)):
+            if cluster_id == -1:
+                continue
+            if idx >= len(self.encoded_sequences):
+                continue
+            seq = self.encoded_sequences[idx]
+            if seq is None or len(seq) == 0:
+                continue
+            sil = trace.get('silhouette_score')
+            try:
+                score = float(sil)
+                if math.isnan(score):
+                    score = float('-inf')
+            except (TypeError, ValueError):
+                score = float('-inf')
+            current = representatives.get(cluster_id)
+            if current is None or score > current['score']:
+                representatives[cluster_id] = {
+                    'index': idx,
+                    'sequence': seq,
+                    'score': score,
+                    'num_events': trace.get('num_events'),
+                }
+
+        if not representatives:
+            print("DTW cluster filter skipped (no valid representatives found).")
+            return 0
+
+        filtered_by_cluster: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
+        filtered_entries: List[Dict[str, Any]] = []
+        filtered_total = 0
+
+        progress = tqdm(
+            total=len(self.traces),
+            desc="Scanning DTW guardrails",
+            disable=len(self.traces) < 200,
+        )
+        for idx, cluster_id in enumerate(self.clusters):
+            if cluster_id == -1:
+                progress.update(1)
+                continue
+            if idx >= len(self.encoded_sequences):
+                progress.update(1)
+                continue
+
+            representative = representatives.get(cluster_id)
+            if not representative:
+                progress.update(1)
+                continue
+            if idx == representative['index']:
+                progress.update(1)
+                continue
+
+            query = representative['sequence']
+            series = self.encoded_sequences[idx]
+            if query is None or series is None or len(query) == 0 or len(series) == 0:
+                continue
+
+            query_list = query.tolist() if hasattr(query, 'tolist') else list(query)
+            series_list = series.tolist() if hasattr(series, 'tolist') else list(series)
+
+            try:
+                sa = subsequence_alignment(query_list, series_list)
+                match = sa.best_match()
+            except Exception as exc:  # noqa: BLE001
+                progress.update(1)
+                trace_id = self.traces[idx].get('trace_id')
+                print(f"[WARN] Subsequence alignment failed for trace {trace_id}: {exc}")
+                continue
+
+            if not match or not match.segment:
+                progress.update(1)
+                continue
+
+            start_idx, end_idx = match.segment
+            start_idx = int(start_idx)
+            end_idx = int(end_idx)
+            matched_len = max(end_idx - start_idx + 1, 0)
+            normalized_distance = (
+                float(match.distance) / matched_len if matched_len else None
+            )
+            reference_len = len(query_list)
+            reference_coverage = (
+                matched_len / reference_len if reference_len else None
+            )
+
+            reject = False
+            if (
+                max_normalized is not None
+                and normalized_distance is not None
+                and normalized_distance > max_normalized
+            ):
+                reject = True
+            if (
+                min_reference_coverage is not None
+                and reference_coverage is not None
+                and reference_coverage < min_reference_coverage
+            ):
+                reject = True
+
+            if not reject:
+                continue
+
+            trace = self.traces[idx]
+            filtered_total += 1
+            info = {
+                'trace_id': trace.get('trace_id'),
+                'normalized_distance': normalized_distance,
+                'reference_coverage': reference_coverage,
+                'matched_length': matched_len,
+                'cluster_id': int(cluster_id),
+                'index': idx,
+            }
+            filtered_entries.append(info)
+            filtered_by_cluster[int(cluster_id)].append(info)
+            if mutate:
+                self.clusters[idx] = -1
+                trace['cluster'] = -1
+
+        if not filtered_total:
+            if mutate:
+                print("DTW cluster filter active but no traces were removed.")
+            else:
+                print("DTW guardrail preview found no candidates to adjust.")
+        else:
+            action = "removed" if mutate else "identified"
+            print(
+                f"\n[info] DTW cluster filter {action} {filtered_total} trace(s) "
+                f"across {len(filtered_by_cluster)} cluster(s)."
+            )
+
+        if mutate:
+            self.cluster_metadata['dtw_filter'] = {
+                'max_normalized_distance': max_normalized,
+                'min_reference_coverage': min_reference_coverage,
+                'filtered_total': filtered_total,
+                'library': 'dtaidistance' if subsequence_alignment else None,
+                'clusters': {
+                    int(cluster_id): {
+                        'filtered_count': len(entries),
+                        'trace_ids': [entry.get('trace_id') for entry in entries],
+                    }
+                    for cluster_id, entries in filtered_by_cluster.items()
+                },
+            }
+        return {
+            'filtered_total': filtered_total,
+            'filtered_traces': filtered_entries,
+            'clusters': filtered_by_cluster,
+        }
+
+    def apply_dtw_guardrails(self, filtered_entries: List[Dict[str, Any]], strength: float = 10.0):
+        """Inflate distances between filtered traces and their former cluster mates."""
+        if self.distance_matrix is None:
+            print("[WARN] Cannot apply DTW guardrails; distance matrix missing.")
+            return 0
+        if not filtered_entries:
+            return 0
+
+        finite = self.distance_matrix[np.isfinite(self.distance_matrix)]
+        if finite.size == 0:
+            base_value = 1e6
+        else:
+            base_value = float(finite.max())
+        guard_value = base_value * (strength if strength and strength > 0 else 10.0)
+
+        adjustments = 0
+        cluster_members: Dict[int, List[int]] = defaultdict(list)
+        for idx, trace in enumerate(self.traces):
+            cluster_id = trace.get('cluster')
+            if cluster_id is None or cluster_id == -1:
+                continue
+            cluster_members[int(cluster_id)].append(idx)
+
+        for entry in filtered_entries:
+            idx = entry.get('index')
+            cluster_id = entry.get('cluster_id')
+            if idx is None or cluster_id is None:
+                continue
+            for member_idx in cluster_members.get(int(cluster_id), []):
+                if member_idx == idx:
+                    continue
+                self.distance_matrix[idx, member_idx] = guard_value
+                self.distance_matrix[member_idx, idx] = guard_value
+                adjustments += 1
+
+        if adjustments:
+            print(
+                f"[info] Applied DTW guardrails to {adjustments} distance entries "
+                f"(guard value={guard_value:.2f})."
+            )
+            self.cluster_metadata['dtw_guardrails'] = {
+                'adjustments': adjustments,
+                'guard_value': guard_value,
+            }
+        return adjustments
+
     def compute_ast_cluster_similarity(self):
         """Compute average cosine similarity of AST vectors within each cluster."""
         if self.clusters is None:
@@ -2306,6 +2641,31 @@ class ScriptClusterer:
 
         self.cluster_metadata['virustotal_cluster_stats'] = stats
         return stats
+
+    def compute_token_idf(self):
+        """Compute inverse document frequency for each token."""
+        total_docs = len(self.sequences)
+        if total_docs == 0:
+            return {}
+        doc_freq = Counter()
+        for seq in self.sequences:
+            if not seq:
+                continue
+            doc_freq.update(set(seq))
+
+        token_idf = {}
+        for token, freq in doc_freq.items():
+            token_idf[token] = math.log((total_docs + 1) / (freq + 1)) + 1.0
+
+        self.token_idf = token_idf
+        ScriptClusterer.TOKEN_IDF_LOOKUP = token_idf
+        ScriptClusterer.TOKEN_IDF_ENABLED = True
+        self.cluster_metadata['token_tfidf'] = {
+            'enabled': True,
+            'vocabulary': len(token_idf),
+        }
+        print(f"[info] Token TF-IDF weighting enabled (unique tokens: {len(token_idf)})")
+        return token_idf
 
     def analyze_clusters(self):
         """Analyze cluster characteristics"""
@@ -2550,6 +2910,16 @@ def main():
                         help='Drop traces with fewer than this many suspicious events (0 keeps all)')
     parser.add_argument('--timestamp', dest='timestamps', action='append',
                         help='Restrict processing to specific timestamp directories (repeatable)')
+    parser.add_argument('--distance-cache',
+                        help='Optional path to persist/reuse the DTW distance matrix between runs.')
+    parser.add_argument('--enable-token-tfidf', action='store_true',
+                        help='Scale token costs by TF-IDF so ubiquitous events contribute less to DTW distances.')
+    parser.add_argument('--cluster-dtw-max-normalized', type=float, default=None,
+                        help='Max normalized subsequence DTW distance before a trace is removed from its cluster.')
+    parser.add_argument('--cluster-dtw-min-reference-coverage', type=float, default=None,
+                        help='Minimum fraction of the representative subsequence that must be matched (e.g., 0.6).')
+    parser.add_argument('--disable-cluster-dtw-filter', action='store_true',
+                        help='Disable the cluster-level subsequence DTW filtering logic.')
 
     args = parser.parse_args()
     sequence_mode = args.sequence_mode
@@ -2561,6 +2931,11 @@ def main():
     if args.load:
         print(f"Loading existing results from {args.load}")
         clusterer = ScriptClusterer.load_results(args.load)
+        if args.distance_cache:
+            clusterer.distance_cache_path = Path(args.distance_cache).expanduser()
+        if args.enable_token_tfidf and clusterer.sequences:
+            clusterer.use_token_tfidf = True
+            clusterer.compute_token_idf()
         if clusterer.capability_features is None:
             clusterer.compute_capability_features()
         clusterer.analyze_clusters()
@@ -2573,6 +2948,8 @@ def main():
             require_ast_preview=args.require_ast_preview,
             allowed_timestamps=args.timestamps,
             min_suspicious_events=args.min_suspicious_events,
+            distance_cache_path=args.distance_cache,
+            use_token_tfidf=args.enable_token_tfidf,
         )
 
         # Extract traces
@@ -2629,11 +3006,38 @@ def main():
             print("WARNING: --num-clusters is deprecated; using it as min_cluster_size for HDBSCAN.")
             min_cluster_size = args.num_clusters
 
-        clusterer.hdbscan_clustering(
-            min_cluster_size=min_cluster_size,
-            min_samples=args.min_samples,
-            cluster_selection_epsilon=args.cluster_selection_epsilon
+        def run_hdbscan():
+            clusterer.hdbscan_clustering(
+                min_cluster_size=min_cluster_size,
+                min_samples=args.min_samples,
+                cluster_selection_epsilon=args.cluster_selection_epsilon
+            )
+
+        run_hdbscan()
+        dtw_filter_enabled = not args.disable_cluster_dtw_filter and (
+            args.cluster_dtw_max_normalized is not None
+            or args.cluster_dtw_min_reference_coverage is not None
         )
+        if dtw_filter_enabled:
+            clusterer.compute_silhouette_scores()
+            preview = clusterer.filter_clusters_by_subsequence(
+                max_normalized=args.cluster_dtw_max_normalized,
+                min_reference_coverage=args.cluster_dtw_min_reference_coverage,
+                mutate=False,
+            )
+            filtered_entries = preview.get('filtered_traces') or []
+            if filtered_entries and clusterer.distance_matrix is not None:
+                adjustments = clusterer.apply_dtw_guardrails(filtered_entries)
+                if adjustments:
+                    run_hdbscan()
+                    clusterer.compute_silhouette_scores()
+            final_filter = clusterer.filter_clusters_by_subsequence(
+                max_normalized=args.cluster_dtw_max_normalized,
+                min_reference_coverage=args.cluster_dtw_min_reference_coverage,
+                mutate=True,
+            )
+            if final_filter.get('filtered_total'):
+                clusterer.compute_silhouette_scores()
         clusterer.capability_clustering(num_clusters=args.capability_clusters)
 
         # Analyze clusters

@@ -52,6 +52,15 @@ Options:
   --max-scripts VALUE  Limit how many scripts are processed (use 0 for no limit).
   --min-cluster-size VALUE
                         Override the minimum HDBSCAN cluster size.
+  --cluster-dtw-max-normalized VALUE
+                        Remove cluster members whose normalized subsequence DTW distance exceeds VALUE.
+  --cluster-dtw-min-reference-coverage VALUE
+                        Remove cluster members whose subsequence match covers less than this fraction of the representative.
+  --disable-cluster-dtw-filter
+                        Disable the cluster-level DTW membership filter regardless of thresholds.
+  --distance-cache PATH
+                        Persist/reuse the DTW distance matrix at PATH (speeds up incremental runs).
+  --enable-token-tfidf  Down-weight very common CDP events by applying TF-IDF weights to DTW costs.
   --cache-key VALUE    Explicit cache directory key (e.g., 20251112-1) for reuse or custom labeling.
   -h, --help           Show this help message and exit.
 
@@ -126,6 +135,10 @@ write_cache_metadata() {
     DTW_MAX_ENV="$DTW_MAX_DISTANCE" \
     DTW_LB_ENV="$DTW_LB_RATIO" \
     DTW_PRUNING_ENV="$DTW_PRUNING_ENABLED" \
+    CLUSTER_DTW_MAX_ENV="$CLUSTER_DTW_MAX_NORMALIZED" \
+    CLUSTER_DTW_COVERAGE_ENV="$CLUSTER_DTW_MIN_REFERENCE_COVERAGE" \
+    CLUSTER_DTW_DISABLED_ENV="$DISABLE_CLUSTER_DTW_FILTER" \
+    DISTANCE_CACHE_ENV="$DISTANCE_CACHE_PATH" \
     SEQUENCE_MODE_ENV="$SEQUENCE_MODE" \
     DOC2VEC_DIM_ENV="$DOC2VEC_DIM" \
     DOC2VEC_WINDOW_ENV="$DOC2VEC_WINDOW" \
@@ -134,6 +147,7 @@ write_cache_metadata() {
     DOC2VEC_NEGATIVE_ENV="$DOC2VEC_NEGATIVE" \
     DOC2VEC_WORKERS_ENV="$DOC2VEC_WORKERS" \
     DATA_DIR_ENV="$DATA_DIR" \
+    TOKEN_TFIDF_ENV="$ENABLE_TOKEN_TFIDF" \
     python3 <<'PY'
 import json
 import os
@@ -160,6 +174,13 @@ def parse_float(name):
     except ValueError:
         return value
 
+cluster_dtw_max = parse_float("CLUSTER_DTW_MAX_ENV")
+cluster_dtw_cov = parse_float("CLUSTER_DTW_COVERAGE_ENV")
+cluster_dtw_enabled = (
+    os.environ.get("CLUSTER_DTW_DISABLED_ENV") != "1"
+    and (cluster_dtw_max is not None or cluster_dtw_cov is not None)
+)
+
 config = {
     "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     "command": os.environ.get("RUN_COMMAND"),
@@ -178,6 +199,13 @@ config = {
         "lb_ratio": parse_float("DTW_LB_ENV"),
         "pruning_enabled": os.environ.get("DTW_PRUNING_ENV") != "0"
     },
+    "cluster_dtw_filter": {
+        "enabled": cluster_dtw_enabled,
+        "max_normalized_distance": cluster_dtw_max,
+        "min_reference_coverage": cluster_dtw_cov,
+    },
+    "token_tfidf_enabled": os.environ.get("TOKEN_TFIDF_ENV") == "1",
+    "distance_cache_path": os.environ.get("DISTANCE_CACHE_ENV") or None,
     "sequence_mode": os.environ.get("SEQUENCE_MODE_ENV"),
     "doc2vec": {
         "dim": parse_int("DOC2VEC_DIM_ENV"),
@@ -214,6 +242,11 @@ DOC2VEC_NEGATIVE="${DOC2VEC_NEGATIVE:-5}"
 DOC2VEC_WORKERS="${DOC2VEC_WORKERS:-}"
 REQUIRE_AST_PREVIEW="${REQUIRE_AST_PREVIEW:-0}"
 MIN_SUSPICIOUS_EVENTS="${MIN_SUSPICIOUS_EVENTS:-0}"
+CLUSTER_DTW_MAX_NORMALIZED="${CLUSTER_DTW_MAX_NORMALIZED:-}"
+CLUSTER_DTW_MIN_REFERENCE_COVERAGE="${CLUSTER_DTW_MIN_REFERENCE_COVERAGE:-}"
+DISABLE_CLUSTER_DTW_FILTER="${DISABLE_CLUSTER_DTW_FILTER:-0}"
+DISTANCE_CACHE_PATH="${DISTANCE_CACHE_PATH:-}"
+ENABLE_TOKEN_TFIDF="${ENABLE_TOKEN_TFIDF:-0}"
 TIMESTAMP_FILTER="${TIMESTAMP_FILTER:-}"
 CACHE_KEY_OVERRIDE="${CACHE_KEY:-}"
 MAX_SCRIPTS_OVERRIDE=""
@@ -353,6 +386,40 @@ while [[ $# -gt 0 ]]; do
             fi
             MIN_CLUSTER_OVERRIDE="$2"
             shift 2
+            ;;
+        --cluster-dtw-max-normalized)
+            if [ -z "${2:-}" ]; then
+                echo "--cluster-dtw-max-normalized requires a numeric value"
+                exit 1
+            fi
+            CLUSTER_DTW_MAX_NORMALIZED="$2"
+            DISABLE_CLUSTER_DTW_FILTER=0
+            shift 2
+            ;;
+        --cluster-dtw-min-reference-coverage)
+            if [ -z "${2:-}" ]; then
+                echo "--cluster-dtw-min-reference-coverage requires a numeric value"
+                exit 1
+            fi
+            CLUSTER_DTW_MIN_REFERENCE_COVERAGE="$2"
+            DISABLE_CLUSTER_DTW_FILTER=0
+            shift 2
+            ;;
+        --disable-cluster-dtw-filter)
+            DISABLE_CLUSTER_DTW_FILTER=1
+            shift
+            ;;
+        --distance-cache)
+            if [ -z "${2:-}" ]; then
+                echo "--distance-cache requires a file path"
+                exit 1
+            fi
+            DISTANCE_CACHE_PATH="$2"
+            shift 2
+            ;;
+        --enable-token-tfidf)
+            ENABLE_TOKEN_TFIDF=1
+            shift
             ;;
         --cache-key)
             if [ -z "${2:-}" ]; then
@@ -535,6 +602,23 @@ echo "  Timestamp key: $TIMESTAMP_KEY"
 echo "  Cache key: $CACHE_DIR_KEY"
 echo "  Cache directory: $RUN_CACHE_DIR"
 echo "  JOBLIB_TEMP_FOLDER: $JOBLIB_TEMP_FOLDER"
+if [ "$DISABLE_CLUSTER_DTW_FILTER" -eq 1 ]; then
+    echo "  Cluster DTW filter: disabled"
+else
+    if [ -n "$CLUSTER_DTW_MAX_NORMALIZED" ] || [ -n "$CLUSTER_DTW_MIN_REFERENCE_COVERAGE" ]; then
+        echo "  Cluster DTW filter: max_norm=${CLUSTER_DTW_MAX_NORMALIZED:-n/a} min_cover=${CLUSTER_DTW_MIN_REFERENCE_COVERAGE:-n/a}"
+    else
+        echo "  Cluster DTW filter: not configured"
+    fi
+fi
+if [ -n "$DISTANCE_CACHE_PATH" ]; then
+    echo "  Distance cache path: $DISTANCE_CACHE_PATH"
+fi
+if [ "$ENABLE_TOKEN_TFIDF" -eq 1 ]; then
+    echo "  Token TF-IDF weighting: enabled"
+else
+    echo "  Token TF-IDF weighting: disabled"
+fi
 echo ""
 
 # Step 1: Check dependencies
@@ -625,10 +709,29 @@ if [ "$USE_CACHE" -eq 0 ]; then
         done
     fi
     FILTER_ARGS+=(--min-suspicious-events "$MIN_SUSPICIOUS_EVENTS")
+    CLUSTER_DTW_ARGS=()
+    if [ "$DISABLE_CLUSTER_DTW_FILTER" -eq 1 ]; then
+        CLUSTER_DTW_ARGS+=(--disable-cluster-dtw-filter)
+    else
+        if [ -n "$CLUSTER_DTW_MAX_NORMALIZED" ]; then
+            CLUSTER_DTW_ARGS+=(--cluster-dtw-max-normalized "$CLUSTER_DTW_MAX_NORMALIZED")
+        fi
+        if [ -n "$CLUSTER_DTW_MIN_REFERENCE_COVERAGE" ]; then
+            CLUSTER_DTW_ARGS+=(--cluster-dtw-min-reference-coverage "$CLUSTER_DTW_MIN_REFERENCE_COVERAGE")
+        fi
+    fi
 
     EMBED_ARGS=(--sequence-mode "$SEQUENCE_MODE" --doc2vec-dim "$DOC2VEC_DIM" --doc2vec-window "$DOC2VEC_WINDOW" --doc2vec-min-count "$DOC2VEC_MIN_COUNT" --doc2vec-epochs "$DOC2VEC_EPOCHS" --doc2vec-negative "$DOC2VEC_NEGATIVE")
     if [ -n "$DOC2VEC_WORKERS" ]; then
         EMBED_ARGS+=(--doc2vec-workers "$DOC2VEC_WORKERS")
+    fi
+    DISTANCE_ARGS=()
+    if [ -n "$DISTANCE_CACHE_PATH" ]; then
+        DISTANCE_ARGS+=(--distance-cache "$DISTANCE_CACHE_PATH")
+    fi
+    TOKEN_TFIDF_ARGS=()
+    if [ "$ENABLE_TOKEN_TFIDF" -eq 1 ]; then
+        TOKEN_TFIDF_ARGS+=(--enable-token-tfidf)
     fi
 
     python3 cluster_scripts.py \
@@ -638,6 +741,9 @@ if [ "$USE_CACHE" -eq 0 ]; then
         --output "$OUTPUT" \
         "${DTW_ARGS[@]}" \
         "${FILTER_ARGS[@]}" \
+        "${CLUSTER_DTW_ARGS[@]}" \
+        "${DISTANCE_ARGS[@]}" \
+        "${TOKEN_TFIDF_ARGS[@]}" \
         "${EMBED_ARGS[@]}"
 
     if [ $? -ne 0 ]; then
