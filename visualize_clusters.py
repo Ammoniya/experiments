@@ -15,7 +15,9 @@ import pickle
 import sys
 import types
 from collections import Counter, defaultdict
+from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlparse
 
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
@@ -25,16 +27,32 @@ os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 import numpy as np
 import pandas as pd
 
+if not hasattr(np, 'bool8'):
+    np.bool8 = np.bool_  # type: ignore[attr-defined]
+if not hasattr(np, 'unicode_'):
+    np.unicode_ = np.str_  # type: ignore[attr-defined]
+
 from subsequence_alignment_cache import (
     cache_is_stale,
     default_cache_path,
     load_alignment_cache,
+)
+from scan_cluster import (
+    convert_wordfence_constraints,
+    describe_constraint_groups,
+    expand_slug_variations,
+    format_vuln_identifier,
+    normalize_version,
+    parse_label,
+    slugify_label,
+    version_satisfies,
 )
 
 DTW_EVENT_PREVIEW = int(os.environ.get("DTW_EVENT_PREVIEW", "30"))
 
 TSNE_PERPLEXITY = max(2, int(os.environ.get("TSNE_PERPLEXITY", "30")))
 TSNE_RANDOM_STATE = int(os.environ.get("TSNE_RANDOM_STATE", "42"))
+PLUGIN_VULN_FALLBACK_LIMIT = 3
 
 
 def _running_inside_ipykernel():
@@ -86,10 +104,11 @@ from cluster_neighbors import compute_cluster_neighbors, normalize_neighbor_mapp
 class ClusterVisualizer:
     """Interactive visualization for clustering results"""
 
-    def __init__(self, results_file, experiment_data_dir, alignment_cache_file=None):
+    def __init__(self, results_file, experiment_data_dir, alignment_cache_file=None, wordfence_db_path=None):
         self.results_file = Path(results_file)
         self.experiment_data_dir = Path(experiment_data_dir)
         self.alignment_cache_path = Path(alignment_cache_file) if alignment_cache_file else default_cache_path(self.results_file)
+        self.wordfence_db_path = Path(wordfence_db_path) if wordfence_db_path else None
 
         # Load results
         print("Loading clustering results...")
@@ -127,11 +146,17 @@ class ClusterVisualizer:
             trace['_index'] = idx
             self.trace_lookup[trace['trace_id']] = idx
         self.cluster_neighbor_lookup = self._load_cluster_neighbors()
+        self.cluster_trace_stats = self._build_cluster_trace_stats()
 
         self.event_type_to_int = {label: idx for idx, label in enumerate(self.event_types)}
         self.numeric_sequences = self._encode_sequences(self.sequences)
         self.cluster_representatives = self._select_cluster_representatives()
         self.ast_display_cache = self._build_ast_display_cache()
+        self.wordfence_vuln_map, self.wordfence_status = self._load_wordfence_vulnerabilities()
+        if self.wordfence_status:
+            print(f"Wordfence CVE lookup: {self.wordfence_status}")
+        self.trace_plugin_vuln_cache = self._build_trace_plugin_vulnerabilities()
+        self.cluster_plugin_vuln_summary = self._build_cluster_plugin_vulnerabilities()
         self.subsequence_cache, self.subsequence_cache_meta = load_alignment_cache(self.alignment_cache_path)
         if not self.subsequence_cache:
             print(
@@ -348,6 +373,431 @@ class ClusterVisualizer:
             preview += ' → ...'
         return preview
 
+    @staticmethod
+    def _summarize_version_counts(version_counter):
+        if not version_counter:
+            return "unspecified"
+        parts = []
+        for version, count in sorted(version_counter.items(), key=lambda kv: (-kv[1], kv[0] or "")):
+            label = version if version and version != 'unspecified' else 'unspecified'
+            if count > 1:
+                parts.append(f"{label} ×{count}")
+            else:
+                parts.append(label)
+        return ', '.join(parts) if parts else 'unspecified'
+
+    @staticmethod
+    def _group_trace_assets(items):
+        grouped = {}
+        seen = set()
+        for item in items or []:
+            if not isinstance(item, dict):
+                continue
+            name = (item.get('name') or '').strip()
+            if not name:
+                continue
+            slug = slugify_label(name)
+            if not slug:
+                continue
+            raw_version = item.get('version')
+            version = str(raw_version).strip() if raw_version not in (None, '') else 'unspecified'
+            key = (slug, version)
+            if key in seen:
+                continue
+            seen.add(key)
+            entry = grouped.setdefault(slug, {
+                'name': name,
+                'slug': slug,
+                'versions': Counter(),
+            })
+            entry['versions'][version] += 1
+
+        assets = []
+        for payload in grouped.values():
+            versions = payload['versions']
+            assets.append({
+                'name': payload['name'],
+                'slug': payload['slug'],
+                'versions': versions,
+                'version_summary': ClusterVisualizer._summarize_version_counts(versions),
+                'total': sum(versions.values()),
+            })
+        assets.sort(key=lambda item: (-item['total'], item['name']))
+        return assets
+
+    @staticmethod
+    def _group_cluster_assets(asset_stats):
+        assets = []
+        for name, payload in (asset_stats or {}).items():
+            versions = payload.get('versions', Counter())
+            traces = payload.get('traces', set())
+            slug = payload.get('slug') or slugify_label(name)
+            assets.append({
+                'name': name,
+                'slug': slug,
+                'versions': versions,
+                'version_summary': ClusterVisualizer._summarize_version_counts(versions),
+                'total': len(traces),
+            })
+        assets.sort(key=lambda item: (-item['total'], item['name']))
+        return assets
+
+    @staticmethod
+    def _dedupe_vuln_records(records):
+        seen = set()
+        unique = []
+        for record in records or []:
+            identifier = record.get('id')
+            if not identifier or identifier in seen:
+                continue
+            seen.add(identifier)
+            unique.append(record)
+        return unique
+
+    def _merge_vuln_records(self, records):
+        if not records:
+            return {'status': 'no_wordfence', 'cves': []}
+        matched = []
+        fallback = []
+        statuses = set()
+        for record in records:
+            statuses.add(record.get('status'))
+            matched.extend(record.get('matches') or [])
+            fallback.extend(record.get('fallback') or [])
+        if matched:
+            return {
+                'status': 'matched',
+                'cves': self._dedupe_vuln_records(matched)
+            }
+        if fallback:
+            limited = self._dedupe_vuln_records(fallback)
+            return {
+                'status': 'fallback',
+                'cves': limited[:PLUGIN_VULN_FALLBACK_LIMIT]
+            }
+        if 'no_matching_version' in statuses:
+            return {'status': 'no_matching_version', 'cves': []}
+        if 'version_missing' in statuses:
+            return {'status': 'version_missing', 'cves': []}
+        return {'status': 'no_wordfence', 'cves': []}
+
+    def _parse_published_timestamp(self, value):
+        if not value:
+            return None
+        text = str(value).strip()
+        if not text:
+            return None
+        candidates = [text]
+        if " " in text:
+            candidates.append(text.replace(" ", "T"))
+        for candidate in candidates:
+            try:
+                return datetime.fromisoformat(candidate)
+            except ValueError:
+                continue
+        return None
+
+    def _load_wordfence_vulnerabilities(self):
+        if not self.wordfence_db_path:
+            return {}, "Wordfence vulnerability database path not provided."
+        path = self.wordfence_db_path
+        if not path.exists():
+            return {}, f"Wordfence vulnerability database not found at {path}"
+        try:
+            with path.open('r', encoding='utf-8') as handle:
+                payload = json.load(handle)
+        except Exception as exc:  # noqa: BLE001
+            return {}, f"Failed to read {path}: {exc}"
+
+        vulns = defaultdict(list)
+
+        def _ingest_entry(entry):
+            if not isinstance(entry, dict):
+                return
+            software_items = entry.get('software') or []
+            if not software_items:
+                return
+            for software in software_items:
+                if not isinstance(software, dict):
+                    continue
+                sw_type = str(software.get('type') or '').lower()
+                if sw_type and sw_type != 'plugin':
+                    continue
+                slug_candidates = {
+                    slugify_label(str(value))
+                    for value in (software.get('slug'), software.get('name'))
+                    if value
+                }
+                slug_candidates.discard('')
+                if not slug_candidates:
+                    continue
+                groups = convert_wordfence_constraints(software.get('affected_versions') or {})
+                base_payload = {
+                    'cve': entry.get('cve'),
+                    'wordfence_uuid': entry.get('id'),
+                    'title': entry.get('title') or '',
+                    'references': entry.get('references') or [],
+                    'published': entry.get('published'),
+                    'published_ts': self._parse_published_timestamp(entry.get('published')),
+                    'constraint_groups': groups,
+                }
+                for slug in slug_candidates:
+                    variations = expand_slug_variations(slug)
+                    if not variations:
+                        variations = {slug}
+                    for alias in variations:
+                        vulns[alias].append(base_payload)
+
+        if isinstance(payload, dict):
+            for entry in payload.values():
+                _ingest_entry(entry)
+        elif isinstance(payload, list):
+            for entry in payload:
+                _ingest_entry(entry)
+        else:
+            return {}, f"Unexpected Wordfence DB format at {path}"
+
+        for slug, entries in vulns.items():
+            entries.sort(key=lambda item: item.get('published_ts') or datetime.min, reverse=True)
+
+        status = f"Loaded CVEs for {len(vulns)} plugin slugs from {path}"
+        if not vulns:
+            status = f"No plugin CVEs found in {path}"
+        return vulns, status
+
+    def _build_trace_plugin_vulnerabilities(self):
+        if not self.wordfence_vuln_map:
+            return {}
+        cache = {}
+        for trace in self.traces:
+            trace_id = trace.get('trace_id')
+            if not trace_id:
+                continue
+            plugins = trace.get('wordpress_plugins') or []
+            cache[trace_id] = self._summarize_plugin_vulns_for_trace(plugins)
+        return cache
+
+    def _summarize_plugin_vulns_for_trace(self, plugins):
+        if not plugins:
+            return []
+        seen = set()
+        summary = []
+        for item in plugins:
+            if not isinstance(item, dict):
+                continue
+            name = item.get('name')
+            slug = slugify_label(str(name)) if name else None
+            raw_version = item.get('version')
+            version_text = str(raw_version).strip() if raw_version else None
+            if not slug:
+                continue
+            key = (slug, version_text)
+            if key in seen:
+                continue
+            seen.add(key)
+            summary.append(self._describe_plugin_vulns(name or slug, slug, version_text))
+        return summary
+
+    def _build_cluster_trace_stats(self):
+        stats = {}
+        for trace in self.traces:
+            cluster_id = trace.get('cluster')
+            if cluster_id in (None, -1):
+                continue
+            entry = stats.setdefault(cluster_id, {
+                'trace_ids': set(),
+                'script_urls': set(),
+                'page_urls': set(),
+                'domain_counts': Counter(),
+                'domain_traces': defaultdict(set),
+            })
+            trace_id = trace.get('trace_id')
+            if trace_id:
+                entry['trace_ids'].add(trace_id)
+            script_url = trace.get('script_url')
+            if script_url:
+                entry['script_urls'].add(script_url)
+            page_url = trace.get('page_url')
+            if page_url:
+                entry['page_urls'].add(page_url)
+                domain = urlparse(page_url).netloc
+            else:
+                domain = urlparse(script_url).netloc if script_url else None
+            if domain:
+                entry['domain_counts'][domain] += 1
+                entry['domain_traces'][domain].add(trace_id)
+
+        normalized = {}
+        for cluster_id, payload in stats.items():
+            domain_details = {}
+            for domain, trace_ids in payload['domain_traces'].items():
+                domain_details[domain] = {
+                    'count': len(trace_ids),
+                    'trace_ids': sorted(tid for tid in trace_ids if tid)
+                }
+            normalized[cluster_id] = {
+                'unique_traces': len(payload['trace_ids']),
+                'unique_script_urls': len(payload['script_urls']),
+                'unique_page_urls': len(payload['page_urls']),
+                'domain_counts': payload['domain_counts'],
+                'domain_details': domain_details,
+            }
+        return normalized
+
+    def get_cluster_trace_summary(self, cluster_id):
+        if cluster_id in (None, -1):
+            return {
+                'unique_traces': 0,
+                'unique_script_urls': 0,
+                'unique_page_urls': 0,
+                'domain_counts': Counter(),
+                'domain_details': {},
+            }
+        return self.cluster_trace_stats.get(cluster_id, {
+            'unique_traces': 0,
+            'unique_script_urls': 0,
+            'unique_page_urls': 0,
+            'domain_counts': Counter(),
+            'domain_details': {},
+        })
+
+    def _describe_plugin_vulns(self, display_name, slug, version_text):
+        entry = {
+            'name': display_name,
+            'slug': slug,
+            'version': version_text,
+            'matches': [],
+            'fallback': [],
+            'status': 'no_wordfence',
+            'message': None,
+        }
+        vulns = self.wordfence_vuln_map.get(slug)
+        if not vulns:
+            entry['message'] = 'No Wordfence CVE records for this plugin.'
+            return entry
+
+        compare_version = normalize_version(version_text) if version_text else None
+        compare_version = compare_version or version_text
+        if compare_version:
+            matched = [self._normalize_vuln_record(v) for v in vulns if version_satisfies(compare_version, v.get('constraint_groups') or [])]
+        else:
+            matched = []
+
+        if matched:
+            entry['status'] = 'matched'
+            entry['matches'] = matched
+            entry['message'] = f"{len(matched)} CVE{'s' if len(matched) != 1 else ''} match version {compare_version}."
+            entry['version'] = compare_version
+            return entry
+
+        fallback = [self._normalize_vuln_record(v) for v in vulns[:PLUGIN_VULN_FALLBACK_LIMIT]]
+        entry['fallback'] = fallback
+        entry['version'] = compare_version or version_text
+        if compare_version:
+            entry['status'] = 'no_matching_version'
+            if fallback:
+                entry['message'] = (
+                    f"No CVEs match version {compare_version}. Showing latest {len(fallback)} Wordfence alerts."
+                )
+            else:
+                entry['message'] = f"No CVEs match version {compare_version}."
+        else:
+            entry['status'] = 'version_missing'
+            if version_text:
+                entry['message'] = (
+                    "Plugin version could not be normalized; showing recent Wordfence alerts."
+                )
+            else:
+                entry['message'] = (
+                    "Plugin version not observed; showing recent Wordfence alerts."
+                )
+        return entry
+
+    def _normalize_vuln_record(self, vuln):
+        references = vuln.get('references') or []
+        reference = None
+        for ref in references:
+            if isinstance(ref, str) and ref:
+                reference = ref
+                break
+        return {
+            'id': format_vuln_identifier(vuln),
+            'title': vuln.get('title') or 'Wordfence advisory',
+            'note': describe_constraint_groups(vuln.get('constraint_groups') or []),
+            'published': vuln.get('published') or 'Unknown date',
+            'reference': reference,
+        }
+
+    def _build_cluster_plugin_vulnerabilities(self):
+        if not self.trace_plugin_vuln_cache:
+            return {}
+        summary = defaultdict(dict)
+        for trace in self.traces:
+            cluster_id = trace.get('cluster')
+            if cluster_id in (None, -1):
+                continue
+            trace_id = trace.get('trace_id')
+            if not trace_id:
+                continue
+            entries = self.trace_plugin_vuln_cache.get(trace_id) or []
+            for record in entries:
+                slug = record.get('slug')
+                if not slug:
+                    continue
+                slot = summary[cluster_id].setdefault(slug, {
+                    'name': record.get('name') or slug,
+                    'slug': slug,
+                    'total': 0,
+                    'matched_traces': 0,
+                    'match_records': [],
+                    'fallback_records': [],
+                    'versions': Counter(),
+                })
+                slot['total'] += 1
+                version = record.get('version')
+                if version:
+                    slot['versions'][version] += 1
+                if record.get('matches'):
+                    slot['matched_traces'] += 1
+                    slot['match_records'].extend(record['matches'])
+                elif record.get('fallback'):
+                    slot['fallback_records'].extend(record['fallback'])
+        return summary
+
+    def get_cluster_vuln_summary(self, cluster_id):
+        if cluster_id in (None, -1):
+            return []
+        entries = self.cluster_plugin_vuln_summary.get(cluster_id) or {}
+        summary = []
+        for data in entries.values():
+            matches = []
+            seen_ids = set()
+            for record in data.get('match_records') or []:
+                identifier = record.get('id')
+                if not identifier or identifier in seen_ids:
+                    continue
+                seen_ids.add(identifier)
+                matches.append(record)
+            fallback = []
+            fallback_seen = set()
+            for record in data.get('fallback_records') or []:
+                identifier = record.get('id')
+                if not identifier or identifier in fallback_seen:
+                    continue
+                fallback_seen.add(identifier)
+                fallback.append(record)
+            summary.append({
+                'name': data.get('name'),
+                'slug': data.get('slug'),
+                'total': data.get('total', 0),
+                'matched_traces': data.get('matched_traces', 0),
+                'matches': matches,
+                'fallback': fallback[:PLUGIN_VULN_FALLBACK_LIMIT],
+                'versions': data.get('versions', Counter()),
+            })
+        summary.sort(key=lambda item: (item['matched_traces'], item['total'], item['name'] or ''), reverse=True)
+        return summary
+
     def get_cluster_wp_distribution(self, cluster_id):
         """Return cached plugin/theme counters for a cluster."""
         if cluster_id is None:
@@ -356,23 +806,58 @@ class ClusterVisualizer:
         if cluster_id in self.cluster_wp_cache:
             return self.cluster_wp_cache[cluster_id]
 
-        plugin_counter = Counter()
-        theme_counter = Counter()
+        plugin_stats = {}
+        theme_stats = {}
 
         for trace in self.traces:
             if trace.get('cluster') != cluster_id:
                 continue
+            trace_id = trace.get('trace_id')
+            plugin_versions = defaultdict(set)
             for item in trace.get('wordpress_plugins', []):
                 label = self._format_wp_label(item)
-                if label:
-                    plugin_counter[label] += 1
+                if not label:
+                    continue
+                base, version = parse_label(label)
+                name = base.strip()
+                if not name:
+                    continue
+                version = version.strip() if version else 'unspecified'
+                plugin_versions[name].add(version)
+            theme_versions = defaultdict(set)
             for item in trace.get('wordpress_themes', []):
                 label = self._format_wp_label(item)
-                if label:
-                    theme_counter[label] += 1
+                if not label:
+                    continue
+                base, version = parse_label(label)
+                name = base.strip()
+                if not name:
+                    continue
+                version = version.strip() if version else 'unspecified'
+                theme_versions[name].add(version)
 
-        self.cluster_wp_cache[cluster_id] = (plugin_counter, theme_counter)
-        return plugin_counter, theme_counter
+            for name, versions in plugin_versions.items():
+                entry = plugin_stats.setdefault(name, {
+                    'slug': slugify_label(name),
+                    'versions': Counter(),
+                    'traces': set(),
+                })
+                entry['traces'].add(trace_id)
+                for version in versions:
+                    entry['versions'][version] += 1
+
+            for name, versions in theme_versions.items():
+                entry = theme_stats.setdefault(name, {
+                    'slug': slugify_label(name),
+                    'versions': Counter(),
+                    'traces': set(),
+                })
+                entry['traces'].add(trace_id)
+                for version in versions:
+                    entry['versions'][version] += 1
+
+        self.cluster_wp_cache[cluster_id] = (plugin_stats, theme_stats)
+        return plugin_stats, theme_stats
 
     @staticmethod
     def _random_pair(rng, size):
@@ -859,7 +1344,11 @@ class ClusterVisualizer:
 
             wp_plugins = trace.get('wordpress_plugins') or []
             wp_themes = trace.get('wordpress_themes') or []
+            plugin_vuln_records = self.trace_plugin_vuln_cache.get(trace_id, []) if self.trace_plugin_vuln_cache else []
             cluster_plugin_counts, cluster_theme_counts = self.get_cluster_wp_distribution(trace.get('cluster'))
+            cluster_vuln_summary = self.get_cluster_vuln_summary(trace.get('cluster'))
+            cluster_trace_summary = self.get_cluster_trace_summary(trace.get('cluster'))
+            domain_details = cluster_trace_summary.get('domain_details') or {}
             nearest_clusters = self.get_cluster_neighbors(trace.get('cluster'), limit=5)
             if nearest_clusters:
                 nearest_clusters_display = ', '.join(
@@ -875,6 +1364,8 @@ class ClusterVisualizer:
             vt_total = vt_summary.get('total_scanners')
             vt_link = vt_summary.get('report_link')
             cluster_vt_stats = self.get_cluster_virustotal_stats(trace.get('cluster'))
+            page_url = trace.get('page_url') or trace.get('script_url')
+            page_domain = urlparse(page_url).netloc if page_url else None
 
             def render_vt_cell():
                 has_data = any([
@@ -932,44 +1423,227 @@ class ClusterVisualizer:
                     text = f"{avg:.2f} avg detections ({scanned}/{total} traces scanned)"
                 return html.Span(text, style={'fontFamily': 'monospace'})
 
-            def render_wp_items(items, empty_text):
-                grouped = defaultdict(Counter)
-                for item in items:
-                    if not isinstance(item, dict):
-                        continue
-                    name = item.get('name')
-                    if not name:
-                        continue
-                    version = item.get('version') or 'unspecified'
-                    grouped[name][version] += 1
+            plugin_assets = self._group_trace_assets(wp_plugins)
+            theme_assets = self._group_trace_assets(wp_themes)
+            trace_vuln_by_slug = defaultdict(list)
+            for record in plugin_vuln_records:
+                slug = record.get('slug')
+                if slug:
+                    trace_vuln_by_slug[slug].append(record)
 
-                if not grouped:
+            cluster_plugin_assets = self._group_cluster_assets(cluster_plugin_counts)
+            cluster_theme_assets = self._group_cluster_assets(cluster_theme_counts)
+            cluster_vuln_by_slug = {entry['slug']: entry for entry in cluster_vuln_summary}
+
+            status_labels = {
+                'matched': 'Exact match',
+                'fallback': 'Recent alerts',
+                'no_matching_version': 'Version mismatch',
+                'version_missing': 'Version unavailable',
+                'no_wordfence': 'Not catalogued',
+                'theme': 'Theme asset',
+            }
+            status_colors = {
+                'matched': '#059669',
+                'fallback': '#d97706',
+                'no_matching_version': '#d97706',
+                'version_missing': '#6366f1',
+                'no_wordfence': '#94a3b8',
+                'theme': '#0ea5e9',
+            }
+
+            def make_record_resolver(record_map):
+                def resolver(slug):
+                    if not slug:
+                        return {'status': 'no_wordfence', 'cves': []}
+                    return self._merge_vuln_records(record_map.get(slug))
+                return resolver
+
+            def cluster_record_resolver(slug):
+                entry = cluster_vuln_by_slug.get(slug)
+                if not entry:
+                    return {'status': 'no_wordfence', 'cves': []}
+                matches = entry.get('matches') or []
+                fallback = entry.get('fallback') or []
+                if matches:
+                    return {'status': 'matched', 'cves': self._dedupe_vuln_records(matches)}
+                if fallback:
+                    return {'status': 'fallback', 'cves': self._dedupe_vuln_records(fallback)[:PLUGIN_VULN_FALLBACK_LIMIT]}
+                return {'status': 'no_wordfence', 'cves': []}
+
+            def render_asset_table(entries, asset_type, resolver, empty_text):
+                if not entries:
                     return html.P(empty_text, style={'fontStyle': 'italic', 'color': '#6b7280'})
-                items_ui = []
-                for name in sorted(grouped.keys()):
-                    version_counter = grouped[name]
-                    version_parts = []
-                    for version, count in version_counter.most_common():
-                        label = version if version and version != 'unspecified' else 'unspecified'
-                        if count > 1:
-                            version_parts.append(f"{label} ×{count}")
-                        else:
-                            version_parts.append(label)
-                    items_ui.append(
-                        html.Li([
-                            html.Strong(name),
-                            html.Span(f": {', '.join(version_parts)}", style={'fontFamily': 'monospace'})
-                        ])
+                rows = []
+                for asset in entries:
+                    slug = asset.get('slug')
+                    total = asset.get('total', 0)
+                    version_summary = asset.get('version_summary') or self._summarize_version_counts(asset.get('versions', {}))
+                    if asset_type == 'plugin':
+                        bundle = resolver(slug)
+                    else:
+                        bundle = {'status': 'theme', 'cves': []}
+                    status = bundle.get('status', 'no_wordfence')
+                    cves = bundle.get('cves', [])
+                    badge = html.Span(
+                        status_labels.get(status, status),
+                        style={
+                            'fontSize': '11px',
+                            'padding': '2px 6px',
+                            'borderRadius': '999px',
+                            'backgroundColor': status_colors.get(status, '#94a3b8'),
+                            'color': '#fff'
+                        }
                     )
-                return html.Ul(items_ui, style={'marginTop': 8})
+                    cve_cells = []
+                    for vuln in cves[:PLUGIN_VULN_FALLBACK_LIMIT]:
+                        tooltip = f"{vuln.get('title', 'Wordfence advisory')} | {vuln.get('note', '')}"
+                        cve_cells.append(html.Span(
+                            vuln['id'],
+                            style={
+                                'display': 'inline-block',
+                                'padding': '2px 6px',
+                                'marginRight': 6,
+                                'marginBottom': 4,
+                                'borderRadius': 4,
+                                'backgroundColor': '#e2e8f0',
+                                'fontFamily': 'monospace',
+                            },
+                            title=tooltip
+                        ))
+                    rows.append(html.Tr([
+                        html.Td(asset['name']),
+                        html.Td(total, style={'textAlign': 'center', 'width': '80px'}),
+                        html.Td(version_summary, style={'fontFamily': 'monospace'}),
+                        html.Td(badge, style={'width': '160px'}),
+                        html.Td(cve_cells or html.Span('—', style={'color': '#6b7280'}))
+                    ]))
+                table = html.Table(
+                    [
+                        html.Thead(html.Tr([
+                            html.Th('Asset'),
+                            html.Th('#'),
+                            html.Th('Versions observed'),
+                            html.Th('Status'),
+                            html.Th('CVEs / alerts')
+                        ])),
+                        html.Tbody(rows)
+                    ],
+                    style={'width': '100%', 'borderCollapse': 'collapse'}
+                )
+                title = "Plugins" if asset_type == 'plugin' else "Themes"
+                return html.Div([
+                    html.Strong(title),
+                    table
+                ], style={'marginTop': 10})
 
-            def render_distribution(counter, empty_text):
-                if not counter:
-                    return html.P(empty_text, style={'fontStyle': 'italic', 'color': '#6b7280'})
-                return html.Ul([
-                    html.Li(f"{label}: {count} scripts", style={'fontFamily': 'monospace'})
-                    for label, count in counter.most_common(8)
-                ], style={'marginTop': 8})
+            def render_cluster_assets_section():
+                if not (cluster_plugin_assets or cluster_theme_assets):
+                    return html.P(
+                        "No WordPress plugins or themes recorded for this cluster.",
+                        style={'fontStyle': 'italic', 'color': '#6b7280'}
+                    )
+                return html.Div([
+                    render_asset_table(
+                        cluster_plugin_assets,
+                        'plugin',
+                        cluster_record_resolver,
+                        "No WordPress plugins observed in this cluster."
+                    ),
+                    render_asset_table(
+                        cluster_theme_assets,
+                        'theme',
+                        lambda _: {'status': 'theme', 'cves': []},
+                        "No WordPress themes observed in this cluster."
+                    )
+                ])
+
+            def summarize_assets_for_traces(trace_ids):
+                plugin_aggregated = {}
+                theme_aggregated = {}
+                for trace_id in trace_ids or []:
+                    trace_entry = self.get_trace_by_id(trace_id)
+                    if not trace_entry:
+                        continue
+                    for asset in self._group_trace_assets(trace_entry.get('wordpress_plugins')):
+                        slug = asset.get('slug')
+                        if not slug:
+                            continue
+                        entry = plugin_aggregated.setdefault(slug, {
+                            'name': asset.get('name'),
+                            'slug': slug,
+                            'versions': Counter(),
+                            'traces': set(),
+                        })
+                        entry['traces'].add(trace_id)
+                        for version, count in (asset.get('versions') or {}).items():
+                            entry['versions'][version] += count
+                    for asset in self._group_trace_assets(trace_entry.get('wordpress_themes')):
+                        slug = asset.get('slug')
+                        if not slug:
+                            continue
+                        entry = theme_aggregated.setdefault(slug, {
+                            'name': asset.get('name'),
+                            'slug': slug,
+                            'versions': Counter(),
+                            'traces': set(),
+                        })
+                        entry['traces'].add(trace_id)
+                        for version, count in (asset.get('versions') or {}).items():
+                            entry['versions'][version] += count
+                def build_summary(source):
+                    summary = []
+                    for data in source.values():
+                        summary.append({
+                            'name': data['name'],
+                            'slug': data['slug'],
+                            'versions': data['versions'],
+                            'version_summary': self._summarize_version_counts(data['versions']),
+                            'total': len(data['traces']),
+                        })
+                    summary.sort(key=lambda item: (-item['total'], item['name']))
+                    return summary
+                return build_summary(plugin_aggregated), build_summary(theme_aggregated)
+
+            def render_domain_plugin_breakdown():
+                if not page_domain:
+                    return html.P(
+                        "Current trace is missing a page URL/domain.",
+                        style={'fontStyle': 'italic', 'color': '#6b7280'}
+                    )
+                domain_info = domain_details.get(page_domain)
+                if not domain_info:
+                    return html.P(
+                        f"No domain metadata recorded for {page_domain} in this cluster.",
+                        style={'fontStyle': 'italic', 'color': '#6b7280'}
+                    )
+                trace_ids = domain_info.get('trace_ids') or []
+                plugin_summary, theme_summary = summarize_assets_for_traces(trace_ids)
+                record_map = defaultdict(list)
+                for trace_id in trace_ids:
+                    for record in self.trace_plugin_vuln_cache.get(trace_id, []):
+                        slug = record.get('slug')
+                        if slug:
+                            record_map[slug].append(record)
+                resolver = make_record_resolver(record_map)
+                return html.Div([
+                    html.H5(
+                        f"{page_domain} ({domain_info.get('count', 0)} page URLs) — current domain",
+                        style={'marginBottom': 6}
+                    ),
+                    render_asset_table(
+                        plugin_summary,
+                        'plugin',
+                        resolver,
+                        f"No WordPress plugins detected for {page_domain}."
+                    ),
+                    render_asset_table(
+                        theme_summary,
+                        'theme',
+                        lambda _: {'status': 'theme', 'cves': []},
+                        f"No WordPress themes detected for {page_domain}."
+                    )
+                ], style={'marginTop': 10})
 
             overview_tab = dcc.Tab(
                 label="Mission Control",
@@ -1011,7 +1685,49 @@ class ClusterVisualizer:
                             html.Tr([html.Td(html.Strong("VirusTotal Verdict:")), html.Td(render_vt_cell())]),
                             html.Tr([html.Td(html.Strong("Cluster Avg VT Detections:")), html.Td(render_cluster_vt_cell())]),
                             html.Tr([html.Td(html.Strong("Timestamp:")), html.Td(trace['timestamp'])]),
-                        ], style={'width': '100%', 'marginTop': 10})
+                        ], style={'width': '100%', 'marginTop': 10}),
+                        html.P(
+                            "Nearest cluster distances are unitless scores derived from the clustering distance matrix (e.g., normalized DTW). Lower values indicate closer behavior.",
+                            style={'fontSize': '12px', 'color': '#4b5563', 'marginTop': 6}
+                        )
+                    ], style={'marginBottom': 20}),
+
+                    html.Div([
+                        html.H4("Cluster Coverage", style={'borderBottom': '2px solid #333', 'paddingBottom': 5}),
+                        html.Table([
+                            html.Tr([
+                                html.Td(html.Strong("Unique data points:")),
+                                html.Td(cluster_trace_summary.get('unique_traces', 0))
+                            ]),
+                            html.Tr([
+                                html.Td(html.Strong("Unique script URLs:")),
+                                html.Td(cluster_trace_summary.get('unique_script_urls', 0))
+                            ]),
+                            html.Tr([
+                                html.Td(html.Strong("Unique page URLs:")),
+                                html.Td(cluster_trace_summary.get('unique_page_urls', 0))
+                            ]),
+                        ], style={'width': '100%', 'marginTop': 10}),
+                        html.Div([
+                            html.Strong("Top page domains (Top 10)"),
+                            (html.Ul([
+                                html.Li(
+                                    f"{domain}: {info.get('count', 0)} page URLs",
+                                    style={'fontFamily': 'monospace'}
+                                )
+                                for domain, info in sorted(
+                                    domain_details.items(),
+                                    key=lambda kv: (-kv[1].get('count', 0), kv[0])
+                                )[:10]
+                            ]) if domain_details else html.P(
+                                'No domains recorded for this cluster.',
+                                style={'fontStyle': 'italic', 'color': '#6b7280'}
+                            )),
+                            html.Div([
+                                html.Strong("Domain WordPress Plugin CVEs", style={'display': 'block', 'marginTop': 10}),
+                                render_domain_plugin_breakdown()
+                            ], style={'marginTop': 6})
+                        ], style={'marginTop': 10})
                     ], style={'marginBottom': 20}),
 
                     html.Div([
@@ -1037,31 +1753,8 @@ class ClusterVisualizer:
                     ], style={'marginBottom': 20}),
 
                     html.Div([
-                        html.H4("WordPress Assets (Trace)", style={'borderBottom': '2px solid #333', 'paddingBottom': 5}),
-                        html.Div([
-                            html.Div([
-                                html.Strong("Plugins"),
-                                render_wp_items(wp_plugins, "No plugins detected in WP paths.")
-                            ], style={'width': '48%'}),
-                            html.Div([
-                                html.Strong("Themes"),
-                                render_wp_items(wp_themes, "No themes detected in WP paths.")
-                            ], style={'width': '48%'})
-                        ], style={'display': 'flex', 'gap': '4%', 'marginTop': 10})
-                    ], style={'marginBottom': 20}),
-
-                    html.Div([
                         html.H4("Cluster WordPress Distribution", style={'borderBottom': '2px solid #333', 'paddingBottom': 5}),
-                        html.Div([
-                            html.Div([
-                                html.Strong("Plugins"),
-                                render_distribution(cluster_plugin_counts, "No plugins observed in this cluster.")
-                            ], style={'width': '48%'}),
-                            html.Div([
-                                html.Strong("Themes"),
-                                render_distribution(cluster_theme_counts, "No themes observed in this cluster.")
-                            ], style={'width': '48%'})
-                        ], style={'display': 'flex', 'gap': '4%', 'marginTop': 10})
+                        render_cluster_assets_section()
                     ], style={'marginBottom': 20}),
 
                     html.Div([
@@ -1388,11 +2081,19 @@ def main():
     parser.add_argument('--alignment-cache',
                         help='Path to precomputed subsequence alignment cache '
                              '(defaults to <results>_subsequence_cache.pkl)')
+    parser.add_argument('--wordfence-db',
+                        default='wordfence_db.json',
+                        help='Path to the Wordfence vulnerability database JSON (default: wordfence_db.json)')
 
     args = parser.parse_args()
 
     # Create visualizer
-    visualizer = ClusterVisualizer(args.results, args.data_dir, alignment_cache_file=args.alignment_cache)
+    visualizer = ClusterVisualizer(
+        args.results,
+        args.data_dir,
+        alignment_cache_file=args.alignment_cache,
+        wordfence_db_path=args.wordfence_db,
+    )
 
     # Create app (even when skipping server so layout can be validated)
     app = visualizer.create_app()

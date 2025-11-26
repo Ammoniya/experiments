@@ -11,8 +11,9 @@ import json
 import pickle
 import sys
 from collections import Counter, defaultdict
+from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Mapping, Sequence, Tuple
 
 from cluster_neighbors import compute_cluster_neighbors, normalize_neighbor_mapping
 
@@ -22,12 +23,24 @@ from subsequence_alignment_cache import (
     load_alignment_cache,
 )
 
+from scan_cluster import (
+    convert_wordfence_constraints,
+    describe_constraint_groups,
+    expand_slug_variations,
+    format_vuln_identifier,
+    normalize_version,
+    parse_label,
+    slugify_label,
+    version_satisfies,
+)
+
 try:
     from dtaidistance.subsequence.dtw import subsequence_alignment
 except ImportError:  # pragma: no cover - optional dependency
     subsequence_alignment = None
 
 DTW_PREVIEW_LIMIT = 15
+PLUGIN_VULN_FALLBACK_LIMIT = 3
 
 
 # --------------------------------------------------------------------------- #
@@ -96,6 +109,222 @@ def build_cluster_wp_distribution(traces: List[Dict[str, Any]]) -> Tuple[Counter
                 themes[label] += 1
 
     return plugins, themes
+
+
+def _parse_published_timestamp(value: Any) -> datetime | None:
+    if not value:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    candidates = [text]
+    if " " in text:
+        candidates.append(text.replace(" ", "T"))
+    for candidate in candidates:
+        try:
+            return datetime.fromisoformat(candidate)
+        except ValueError:
+            continue
+    return None
+
+
+def load_wordfence_vuln_map(path: Path | None) -> dict[str, list[dict[str, Any]]]:
+    if path is None or not path.exists():
+        return {}
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except Exception:
+        return {}
+
+    vulns: dict[str, list[dict[str, Any]]] = defaultdict(list)
+
+    def _ingest_entry(entry: Mapping[str, Any]) -> None:
+        software_items = entry.get("software") or []
+        if not isinstance(software_items, Sequence):
+            return
+        for software in software_items:
+            if not isinstance(software, Mapping):
+                continue
+            sw_type = str(software.get("type") or "").lower()
+            if sw_type and sw_type != "plugin":
+                continue
+            slug_candidates = {
+                slugify_label(str(value))
+                for value in (software.get("slug"), software.get("name"))
+                if value
+            }
+            slug_candidates.discard("")
+            if not slug_candidates:
+                continue
+            groups = convert_wordfence_constraints(software.get("affected_versions") or {})
+            base_payload = {
+                "cve": entry.get("cve"),
+                "wordfence_uuid": entry.get("id"),
+                "title": entry.get("title") or "",
+                "references": entry.get("references") or [],
+                "published": entry.get("published"),
+                "published_ts": _parse_published_timestamp(entry.get("published")),
+                "constraint_groups": groups,
+            }
+            for slug in slug_candidates:
+                variants = expand_slug_variations(slug) or {slug}
+                for alias in variants:
+                    vulns[alias].append(base_payload)
+
+    if isinstance(payload, Mapping):
+        for entry in payload.values():
+            if isinstance(entry, Mapping):
+                _ingest_entry(entry)
+    elif isinstance(payload, Sequence):
+        for entry in payload:
+            if isinstance(entry, Mapping):
+                _ingest_entry(entry)
+
+    for slug, entries in vulns.items():
+        entries.sort(key=lambda item: item.get("published_ts") or datetime.min, reverse=True)
+    return vulns
+
+
+def _normalize_vuln_record(vuln: Mapping[str, Any]) -> Dict[str, Any]:
+    references = vuln.get("references") or []
+    reference = None
+    for ref in references:
+        if isinstance(ref, str) and ref:
+            reference = ref
+            break
+    return {
+        "id": format_vuln_identifier(vuln),
+        "title": vuln.get("title") or "Wordfence advisory",
+        "note": describe_constraint_groups(vuln.get("constraint_groups") or []),
+        "published": vuln.get("published") or "Unknown date",
+        "reference": reference,
+    }
+
+
+def _dedupe_vuln_records(records: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
+    seen: set[str] = set()
+    unique: List[Dict[str, Any]] = []
+    for record in records or []:
+        identifier = record.get("id")
+        if not identifier or identifier in seen:
+            continue
+        seen.add(identifier)
+        unique.append(dict(record))
+    return unique
+
+
+def _unique_plugin_assets(items: Sequence[Mapping[str, Any]] | None) -> List[Dict[str, Any]]:
+    seen: set[tuple[str, str]] = set()
+    assets: List[Dict[str, Any]] = []
+    for item in items or []:
+        if not isinstance(item, Mapping):
+            continue
+        name = (item.get("name") or "").strip()
+        if not name:
+            continue
+        slug = slugify_label(name)
+        if not slug:
+            continue
+        raw_version = item.get("version")
+        version = str(raw_version).strip() if raw_version not in (None, "") else None
+        key = (slug, version or "")
+        if key in seen:
+            continue
+        seen.add(key)
+        assets.append({"name": name, "slug": slug, "version": version})
+    assets.sort(key=lambda asset: asset["name"])
+    return assets
+
+
+def summarize_plugins_for_trace(trace: Mapping[str, Any], vuln_map: Mapping[str, Sequence[Mapping[str, Any]]]) -> List[Dict[str, Any]]:
+    assets = _unique_plugin_assets(trace.get("wordpress_plugins"))
+    if not assets or not vuln_map:
+        return []
+    summary: List[Dict[str, Any]] = []
+    for asset in assets:
+        slug = asset["slug"]
+        version_text = asset.get("version")
+        entry = {
+            "name": asset["name"],
+            "slug": slug,
+            "version": version_text,
+            "status": "no_wordfence",
+            "matches": [],
+            "fallback": [],
+        }
+        vulns = vuln_map.get(slug)
+        if not vulns:
+            summary.append(entry)
+            continue
+        compare_version = normalize_version(version_text) if version_text else None
+        compare_version = compare_version or version_text
+        if compare_version:
+            matched = [
+                _normalize_vuln_record(v)
+                for v in vulns
+                if version_satisfies(str(compare_version), v.get("constraint_groups") or [])
+            ]
+        else:
+            matched = []
+        if matched:
+            entry["status"] = "matched"
+            entry["matches"] = _dedupe_vuln_records(matched)
+            summary.append(entry)
+            continue
+        fallback = [_normalize_vuln_record(v) for v in vulns[:PLUGIN_VULN_FALLBACK_LIMIT]]
+        if compare_version:
+            entry["status"] = "no_matching_version"
+        elif version_text:
+            entry["status"] = "version_missing"
+        else:
+            entry["status"] = "version_missing"
+        entry["fallback"] = fallback
+        summary.append(entry)
+    return summary
+
+
+def aggregate_cluster_plugin_vulns(
+    cluster_traces: Sequence[Mapping[str, Any]],
+    trace_plugin_lookup: Mapping[str, Sequence[Mapping[str, Any]]],
+) -> List[Dict[str, Any]]:
+    summary: Dict[str, Dict[str, Any]] = {}
+    for trace in cluster_traces:
+        trace_id = trace.get("trace_id")
+        entries = trace_plugin_lookup.get(trace_id) or []
+        for plugin_entry in entries:
+            slug = plugin_entry.get("slug")
+            if not slug:
+                continue
+            record = summary.setdefault(slug, {
+                "name": plugin_entry.get("name"),
+                "slug": slug,
+                "trace_ids": set(),
+                "matched_trace_ids": set(),
+                "match_records": [],
+                "fallback_records": [],
+            })
+            record["trace_ids"].add(trace_id)
+            matches = plugin_entry.get("matches") or []
+            fallback = plugin_entry.get("fallback") or []
+            if matches:
+                record["matched_trace_ids"].add(trace_id)
+                record["match_records"].extend(matches)
+            elif fallback:
+                record["fallback_records"].extend(fallback)
+    aggregated: List[Dict[str, Any]] = []
+    for values in summary.values():
+        item = {
+            "name": values.get("name"),
+            "slug": values.get("slug"),
+            "total_traces": len(values["trace_ids"]),
+            "matched_traces": len(values["matched_trace_ids"]),
+            "matches": _dedupe_vuln_records(values.get("match_records")),
+            "fallback": _dedupe_vuln_records(values.get("fallback_records"))[:PLUGIN_VULN_FALLBACK_LIMIT],
+        }
+        aggregated.append(item)
+    aggregated.sort(key=lambda entry: (entry["matched_traces"], entry["total_traces"], entry["name"] or ""), reverse=True)
+    return aggregated
 
 
 def script_path(trace: Dict[str, Any], data_dir: Path) -> str:
@@ -278,7 +507,7 @@ def _serialize_neighbors(entries: List[Any]) -> List[Dict[str, Any]]:
     return serialized
 
 
-def generate_report(results_path: Path, data_dir: Path) -> Dict[str, Any]:
+def generate_report(results_path: Path, data_dir: Path, wordfence_path: Path | None = None) -> Dict[str, Any]:
     results = load_results(results_path)
     traces: List[Dict[str, Any]] = results["traces"]
     distance_matrix = results.get("distance_matrix")
@@ -303,6 +532,13 @@ def generate_report(results_path: Path, data_dir: Path) -> Dict[str, Any]:
     overall_silhouette = cluster_metadata.get("silhouette_overall")
     ast_similarity_lookup = cluster_metadata.get("ast_similarity", {}) or {}
     ast_counts = cluster_metadata.get("ast_counts", {}) or {}
+    wordfence_vuln_map = load_wordfence_vuln_map(wordfence_path)
+    trace_plugin_vulns: Dict[str, List[Dict[str, Any]]] = {}
+    if wordfence_vuln_map:
+        for trace in traces:
+            summary = summarize_plugins_for_trace(trace, wordfence_vuln_map)
+            if summary:
+                trace_plugin_vulns[trace.get("trace_id")] = summary
 
     clusters: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
     for trace in traces:
@@ -317,6 +553,7 @@ def generate_report(results_path: Path, data_dir: Path) -> Dict[str, Any]:
         "results_path": str(results_path),
         "data_dir": str(data_dir),
         "overall_silhouette": safe_float(overall_silhouette),
+        "wordfence_db": str(wordfence_path) if wordfence_path else None,
         "cluster_count": len(clusters),
         "clusters": [],
     }
@@ -349,6 +586,8 @@ def generate_report(results_path: Path, data_dir: Path) -> Dict[str, Any]:
         ast_total = ast_counts.get(cluster_id, ast_scripts)
         neighbor_entries = _serialize_neighbors(cluster_neighbors.get(cluster_id) or [])
 
+        plugin_vuln_summary = aggregate_cluster_plugin_vulns(members, trace_plugin_vulns) if trace_plugin_vulns else []
+
         cluster_entry: Dict[str, Any] = {
             "cluster_id": cluster_id,
             "count": len(members),
@@ -365,6 +604,7 @@ def generate_report(results_path: Path, data_dir: Path) -> Dict[str, Any]:
             ),
             "wordpress_plugins": counter_to_entries(plugin_counts, limit=20),
             "wordpress_themes": counter_to_entries(theme_counts, limit=20),
+            "wordpress_plugin_cves": plugin_vuln_summary,
             "traces": [],
         }
 
@@ -413,6 +653,7 @@ def generate_report(results_path: Path, data_dir: Path) -> Dict[str, Any]:
                 "virustotal": vt_summary or None,
                 "virustotal_verdict": trace.get("virustotal_verdict") or (vt_summary or {}).get("verdict"),
                 "virustotal_verdict_count": trace.get("virustotal_verdict_count") or (vt_summary or {}).get("verdict_count"),
+                "wordpress_plugin_cves": trace_plugin_vulns.get(trace.get("trace_id"), []),
                 "alignment": alignment,
                 "ast_preview": trace.get("ast_preview"),
                 "ast_fingerprint_summary": {
@@ -492,6 +733,8 @@ def main():
                         help="Optional path to write the report instead of stdout")
     parser.add_argument("--text-output",
                         help="Optional path for a plaintext summary (defaults to OUTPUT with .txt suffix)")
+    parser.add_argument("--wordfence-db", default="wordfence_db.json",
+                        help="Path to the Wordfence vulnerability database JSON (default: wordfence_db.json)")
     args = parser.parse_args()
 
     results_path = Path(args.results).resolve()
@@ -504,7 +747,8 @@ def main():
 
     output_path = Path(args.output).resolve() if args.output else None
     text_output_path = Path(args.text_output).resolve() if args.text_output else None
-    report = generate_report(results_path, data_dir)
+    wordfence_path = Path(args.wordfence_db).resolve() if args.wordfence_db else None
+    report = generate_report(results_path, data_dir, wordfence_path)
     text_summary = render_text_report(report)
 
     if output_path:

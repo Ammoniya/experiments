@@ -1,4 +1,4 @@
-./run_clustering.sh \
+./prepare_experiment_data.sh && ./run_clustering.sh \
   --no-cache \
   --require-ast-preview \
   --max-scripts 0 \
@@ -9,7 +9,8 @@
   --disable-dtw-pruning \
   --cluster-dtw-max-normalized 800 \
   --cluster-dtw-min-reference-coverage 0.6 \
-  --distance-cache cache/dtw_matrix_latest.npz
+  --distance-cache cache/dtw_matrix_latest.npz \
+  --wordfence-db wordfence_db.json
 
 
 

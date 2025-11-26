@@ -82,6 +82,94 @@ class OldTrace:
     script_path: Path | None
 
 
+def describe_old_only_trace(
+    trace_id: str,
+    new_trace_index: Mapping[str, Dict[str, Any]],
+    new_cache_key: str,
+) -> Dict[str, Any]:
+    """
+    Provide diagnostic context for traces that disappeared from the old cluster.
+    """
+    trace_entry = new_trace_index.get(trace_id)
+    if trace_entry is None:
+        return {
+            "trace_id": trace_id,
+            "status": "missing_from_new_cache",
+            "new_cluster_id": None,
+            "reason": (
+                f"Trace not present in {new_cache_key}'s cluster_report.json; "
+                "it was removed earlier in the pipeline."
+            ),
+        }
+
+    new_cluster_id = str(trace_entry.get("cluster_id"))
+    status = "reclassified_as_outlier" if new_cluster_id == OUTLIER_CLUSTER_ID else "unmapped_in_new_cluster"
+    alignment_info = trace_entry.get("alignment")
+    if not isinstance(alignment_info, dict):
+        alignment_info = None
+
+    alignment_error = alignment_info.get("error") if alignment_info else None
+    alignment_distance = alignment_info.get("normalized_distance") if alignment_info else None
+    alignment_coverage = alignment_info.get("coverage_ratio") if alignment_info else None
+
+    reason_parts = []
+    if status == "reclassified_as_outlier":
+        reason_parts.append("Trace reclassified as noise/outlier (-1).")
+    else:
+        reason_parts.append(
+            f"Trace assigned to cluster {new_cluster_id} in {new_cache_key} but excluded from sample export."
+        )
+    if alignment_error:
+        reason_parts.append(f"Subsequence DTW: {alignment_error}")
+    elif alignment_distance is not None or alignment_coverage is not None:
+        stats = []
+        if alignment_distance is not None:
+            stats.append(f"normalized_distance={alignment_distance}")
+        if alignment_coverage is not None:
+            stats.append(f"coverage_ratio={alignment_coverage}")
+        if stats:
+            reason_parts.append("Subsequence DTW stats: " + ", ".join(stats))
+
+    details: Dict[str, Any] = {
+        "trace_id": trace_id,
+        "status": status,
+        "new_cluster_id": new_cluster_id,
+        "reason": " ".join(reason_parts),
+    }
+    if alignment_error:
+        details["alignment_error"] = alignment_error
+    if alignment_distance is not None:
+        details["alignment_normalized_distance"] = alignment_distance
+    if alignment_coverage is not None:
+        details["alignment_coverage_ratio"] = alignment_coverage
+    return details
+
+
+def describe_new_only_trace(
+    trace_id: str,
+    old_trace_index: Mapping[str, Dict[str, Any]],
+    old_cache_key: str,
+) -> Dict[str, Any]:
+    """Explain whether a novel trace is brand new or previously mapped elsewhere."""
+    trace_entry = old_trace_index.get(trace_id)
+    if trace_entry is None:
+        return {
+            "trace_id": trace_id,
+            "status": "new_to_dataset",
+            "old_cluster_id": None,
+            "reason": f"Trace absent from {old_cache_key}'s cluster_report.json; likely first appearance.",
+        }
+    old_cluster_id = str(trace_entry.get("cluster_id"))
+    return {
+        "trace_id": trace_id,
+        "status": "moved_from_previous_cluster",
+        "old_cluster_id": old_cluster_id,
+        "reason": (
+            f"Trace existed in cluster {old_cluster_id} of {old_cache_key} but was not exported previously."
+        ),
+    }
+
+
 def iter_old_traces(samples_root: Path, cache_key: str) -> Iterable[OldTrace]:
     base = samples_root / cache_key
     if not base.exists():
@@ -201,7 +289,7 @@ def main() -> None:
     ensure_dir(new_samples_root, args.dry_run)
 
     new_report_path, new_clusters, new_trace_index = load_cluster_index(cache_root, args.new_cache_key)
-    old_report_path, old_clusters, _ = load_cluster_index(cache_root, args.old_cache_key)
+    old_report_path, old_clusters, old_trace_index = load_cluster_index(cache_root, args.old_cache_key)
     print(f"[info] Loaded {len(new_trace_index):,} traces from {new_report_path}")
 
     per_new_cluster_records: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
@@ -324,10 +412,15 @@ def main() -> None:
                     }
                 )
 
+        novel_details = [
+            describe_new_only_trace(trace_id, old_trace_index, args.old_cache_key) for trace_id in novel_trace_ids
+        ]
+
         novel_traces_by_cluster[new_cluster_id] = {
             "trace_ids": novel_trace_ids,
             "sample": novel_trace_ids[:TRACE_SAMPLE_LIMIT],
             "total": len(novel_trace_ids),
+            "details": novel_details,
         }
 
         selected_traces = per_new_cluster_trace_entries[new_cluster_id]
@@ -377,6 +470,9 @@ def main() -> None:
         removed_traces = sorted(trace_id for trace_id in manifest_traces if trace_id not in new_trace_index)
         unmapped_traces = sorted(manifest_traces - mapped_ids)
         old_only_traces = sorted(set(removed_traces).union(unmapped_traces))
+        old_only_details = [
+            describe_old_only_trace(trace_id, new_trace_index, args.new_cache_key) for trace_id in old_only_traces
+        ]
 
         if not cluster_map:
             cluster_mappings.append(
@@ -392,6 +488,8 @@ def main() -> None:
                     "trace_ids_in_both_clusters": [],
                     "trace_ids_only_in_new_cluster": [],
                     "trace_ids_only_in_old_cluster": old_only_traces,
+                    "trace_ids_only_in_old_cluster_details": old_only_details,
+                    "trace_ids_only_in_new_cluster_details": [],
                 }
             )
             continue
@@ -401,6 +499,7 @@ def main() -> None:
             novel_info = novel_traces_by_cluster.get(
                 new_cluster_id, {"trace_ids": [], "sample": [], "total": 0}
             )
+            novel_details = novel_info.get("details", [])
             cluster_mappings.append(
                 {
                     "old_cluster_id": old_cluster_id,
@@ -418,6 +517,8 @@ def main() -> None:
                     "trace_ids_in_both_clusters": trace_ids,
                     "trace_ids_only_in_new_cluster": novel_info["trace_ids"],
                     "trace_ids_only_in_old_cluster": old_only_traces,
+                    "trace_ids_only_in_old_cluster_details": old_only_details,
+                    "trace_ids_only_in_new_cluster_details": novel_details,
                 }
             )
             seen_new_clusters.add(new_cluster_id)
@@ -439,6 +540,7 @@ def main() -> None:
                 "trace_ids_in_both_clusters": [],
                 "trace_ids_only_in_new_cluster": info["trace_ids"],
                 "trace_ids_only_in_old_cluster": [],
+                "trace_ids_only_in_new_cluster_details": info.get("details", []),
             }
         )
 

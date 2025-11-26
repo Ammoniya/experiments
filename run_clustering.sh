@@ -8,6 +8,7 @@ ORIGINAL_COMMAND="$0 $*"
 DEFAULT_OUTPUT="clustering_results.pkl"
 DEFAULT_DTW_MAX_DISTANCE="${DEFAULT_DTW_MAX_DISTANCE:-200}"
 DEFAULT_DTW_LB_RATIO="${DEFAULT_DTW_LB_RATIO:-0.05}"
+WORDFENCE_DB="${WORDFENCE_DB:-wordfence_db.json}"
 
 # Ensure joblib has a writable temp directory (shared memory is not available here)
 if [ -z "${JOBLIB_TEMP_FOLDER:-}" ]; then
@@ -829,4 +830,5 @@ echo ""
 python3 visualize_clusters.py \
     --results "$OUTPUT" \
     --data-dir "$DATA_DIR" \
+    --wordfence-db "$WORDFENCE_DB" \
     "${VIZ_ARGS[@]}"
