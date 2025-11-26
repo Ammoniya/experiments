@@ -356,6 +356,14 @@ while [[ $# -gt 0 ]]; do
             DOC2VEC_WORKERS="$2"
             shift 2
             ;;
+        --wordfence-db)
+            if [ -z "${2:-}" ]; then
+                echo "--wordfence-db requires a path to the Wordfence JSON database"
+                exit 1
+            fi
+            WORDFENCE_DB="$2"
+            shift 2
+            ;;
         --disable-dtw-pruning)
             DTW_PRUNING_ENABLED=0
             shift
@@ -795,7 +803,8 @@ echo "[6/7] Generating cluster report (JSON)..."
 python3 generate_cluster_report.py \
     --results "$OUTPUT" \
     --data-dir "$DATA_DIR" \
-    --output "$REPORT_FILE"
+    --output "$REPORT_FILE" \
+    --wordfence-db "$WORDFENCE_DB"
 if [ $? -ne 0 ]; then
     echo "Failed to generate cluster report!"
     exit 1
