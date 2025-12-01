@@ -200,11 +200,21 @@ def iter_old_traces(samples_root: Path, cache_key: str) -> Iterable[OldTrace]:
             trace_id = str(trace.get("trace_id") or "").strip()
             if not trace_id:
                 continue
+            output_file = trace.get("output_file")
             script_path = trace.get("script_path")
+            resolved_script_path: Path | None = None
+            if isinstance(output_file, str) and output_file:
+                candidate = cluster_dir / output_file
+                if candidate.exists():
+                    resolved_script_path = candidate
+            if resolved_script_path is None and isinstance(script_path, str) and script_path:
+                candidate = Path(script_path)
+                if candidate.exists():
+                    resolved_script_path = candidate
             yield OldTrace(
                 trace_id=trace_id,
                 old_cluster_id=str(cluster_id),
-                script_path=Path(script_path) if isinstance(script_path, str) and script_path else None,
+                script_path=resolved_script_path,
             )
 
 
@@ -303,6 +313,7 @@ def main() -> None:
     novel_traces_by_cluster: Dict[str, Dict[str, Any]] = {}
 
     missing_traces: List[str] = []
+    missing_script_files: List[str] = []
     total_copied = 0
     exported_trace_ids: set[str] = set()
 
@@ -320,16 +331,16 @@ def main() -> None:
         old_to_new_map[old_trace.old_cluster_id][new_cluster_id].append(old_trace.trace_id)
 
         script_path = trace_entry.get("script_path")
-        candidate_paths = [script_path, old_trace.script_path]
-        resolved_src: Path | None = None
-        for candidate in candidate_paths:
-            if isinstance(candidate, str) and candidate:
-                candidate_path = Path(candidate)
-                if candidate_path.exists():
-                    resolved_src = candidate_path
-                    break
+        candidate_paths: List[Path] = []
+        if isinstance(script_path, str) and script_path:
+            candidate_paths.append(Path(script_path))
+        if old_trace.script_path:
+            candidate_paths.append(old_trace.script_path)
+        resolved_src = next((path for path in candidate_paths if path.exists()), None)
         if resolved_src is None:
-            raise SystemExit(f"Unable to locate script file for trace {old_trace.trace_id}")
+            missing_script_files.append(old_trace.trace_id)
+            print(f"[warn] Skipping trace {old_trace.trace_id}; JS payload not found.", file=sys.stderr)
+            continue
 
         new_cluster_dir = new_samples_root / f"cluster-{new_cluster_id}"
         ensure_dir(new_cluster_dir, args.dry_run)
@@ -377,11 +388,20 @@ def main() -> None:
                     continue
                 script_path = trace_entry.get("script_path")
                 if not isinstance(script_path, str) or not script_path:
-                    raise SystemExit(
-                        f"Trace {trace_id} in cluster {new_cluster_id} from {args.new_cache_key} "
-                        "is missing a script_path."
+                    missing_script_files.append(trace_id)
+                    print(
+                        f"[warn] Skipping novel trace {trace_id} from cluster {new_cluster_id}; missing script_path.",
+                        file=sys.stderr,
                     )
+                    continue
                 resolved_src = Path(script_path)
+                if not resolved_src.exists():
+                    missing_script_files.append(trace_id)
+                    print(
+                        f"[warn] Skipping novel trace {trace_id} from cluster {new_cluster_id}; JS payload not found.",
+                        file=sys.stderr,
+                    )
+                    continue
                 new_cluster_counters[new_cluster_id] += 1
                 file_index = new_cluster_counters[new_cluster_id]
                 dest_name = format_output_filename(
@@ -557,6 +577,8 @@ def main() -> None:
     print(f"[info] Copied {total_copied} traces across {len(per_new_cluster_records)} new clusters.")
     if missing_traces:
         print(f"[warn] {len(missing_traces)} traces from {args.old_cache_key} did not exist in {args.new_cache_key}.")
+    if missing_script_files:
+        print(f"[warn] Skipped {len(missing_script_files)} traces due to missing JS payloads.")
 
 
 if __name__ == "__main__":

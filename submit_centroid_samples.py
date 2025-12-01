@@ -30,8 +30,8 @@ BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_RATE_LIMIT = 4          # requests per minute (VirusTotal free tier)
 DEFAULT_DAILY_CAP = 500         # maximum requests per day
 VT_GUI_BASE = "https://www.virustotal.com/gui/file"
-# HARDCODED_VT_API_KEY = "d41c5c9cbbe2fdcad140c9fae60c2bf7cdf99304db49daee8f69ff1379250d27"
-HARDCODED_VT_API_KEY = "d63a5a61329f7274c975839c99db74bff6052a045dcbbbf0d97731c5f16ade34"
+HARDCODED_VT_API_KEY = "d41c5c9cbbe2fdcad140c9fae60c2bf7cdf99304db49daee8f69ff1379250d27"
+# HARDCODED_VT_API_KEY = "d63a5a61329f7274c975839c99db74bff6052a045dcbbbf0d97731c5f16ade34"
 DEFAULT_EXPERIMENT_ROOT = BASE_DIR / "experiment_data"
 ANSI_RESET = "\033[0m"
 ANSI_GREEN = "\033[92m"
@@ -173,6 +173,19 @@ def load_existing_manifest(manifest_path: Path, cluster_key: str) -> List[Dict[s
     if isinstance(entries, list):
         return entries
     return []
+
+
+def manifest_entry_has_error(entry: Dict[str, Any]) -> bool:
+    """
+    Return True when the manifest entry recorded a VirusTotal error or is missing a summary.
+    """
+    vt_summary = entry.get("vt_summary")
+    if not isinstance(vt_summary, dict):
+        return True
+    error_value = vt_summary.get("error")
+    if isinstance(error_value, str):
+        return bool(error_value.strip())
+    return bool(error_value)
 
 
 def entry_to_table_row(entry: Dict[str, Any]) -> Dict[str, str]:
@@ -586,23 +599,59 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     manifest_entries: List[Dict[str, Any]] = load_existing_manifest(
         manifest_path, args.cluster_key
     )
-    processed_pairs = {
-        (int(entry.get("cluster_id")), entry.get("trace_id"))
-        for entry in manifest_entries
-        if entry.get("trace_id") is not None and entry.get("cluster_id") is not None
-    }
-    processed_counts = Counter(
-        int(entry["cluster_id"]) for entry in manifest_entries if entry.get("cluster_id") is not None
-    )
+    entry_index_lookup: Dict[Tuple[int, Optional[str]], int] = {}
+    retry_pairs: set[Tuple[int, Optional[str]]] = set()
+    for idx, entry in enumerate(manifest_entries):
+        if entry.get("cluster_id") is None:
+            continue
+        cluster_id = int(entry["cluster_id"])
+        trace_id = entry.get("trace_id")
+        trace_key = str(trace_id) if trace_id is not None else None
+        pair = (cluster_id, trace_key)
+        entry_index_lookup[pair] = idx
+        if manifest_entry_has_error(entry):
+            retry_pairs.add(pair)
+
+    if retry_pairs:
+        suffix = "y" if len(retry_pairs) == 1 else "ies"
+        print(
+            f"Detected {len(retry_pairs)} manifest entr{suffix} with VirusTotal errors; "
+            "they will be retried when included in the current selection."
+        )
+
+    processed_pairs = set(entry_index_lookup.keys()) - retry_pairs
+    processed_counts = Counter(pair[0] for pair in processed_pairs)
     per_cluster_counter: Dict[int, int] = defaultdict(int, processed_counts)
 
-    pending = [
-        item
-        for item in selected
-        if (item[0], item[1].get("trace_id")) not in processed_pairs
-    ]
+    selected_pairs: set[Tuple[int, Optional[str]]] = set()
+    pending: List[Tuple[int, Dict[str, Any]]] = []
+    for item in selected:
+        cluster_id, trace = item
+        trace_id_value = trace.get("trace_id")
+        trace_key = str(trace_id_value) if trace_id_value is not None else None
+        pair = (cluster_id, trace_key)
+        selected_pairs.add(pair)
+        if pair in processed_pairs:
+            continue
+        pending.append(item)
+
+    if retry_pairs:
+        missing_retries = retry_pairs - selected_pairs
+        if missing_retries:
+            suffix = "y was" if len(missing_retries) == 1 else "ies were"
+            print(
+                f"Warning: {len(missing_retries)} manifest entr{suffix} flagged for retry but "
+                "filtered out of the current run; adjust cluster filters or max-per-cluster "
+                "to process them."
+            )
+
     if not pending:
-        if manifest_entries:
+        if retry_pairs and manifest_entries:
+            print(
+                "No pending submissions match the requested filters, so existing manifest errors "
+                "remain until their traces are selected again."
+            )
+        elif manifest_entries:
             print("All selected samples already processed; manifest is up to date.")
         else:
             print("No candidate traces found for the provided filters.")
@@ -629,12 +678,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     try:
         for index, (cluster_id, trace) in enumerate(progress, start=1):
-            if (cluster_id, trace.get("trace_id")) in processed_pairs:
+            trace_id_value = trace.get("trace_id")
+            trace_key = str(trace_id_value) if trace_id_value is not None else None
+            pair = (cluster_id, trace_key)
+            if pair in processed_pairs:
                 continue
             per_cluster_counter[cluster_id] += 1
             progress.write(
                 f"[{index}/{len(pending)}] Cluster {cluster_id}: "
-                f"{trace.get('trace_id')} ({trace.get('script_url')})"
+                f"{trace_id_value} ({trace.get('script_url')})"
             )
 
             source_path = resolve_script_path(trace, experiment_data_root)
@@ -685,26 +737,30 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 if vt_result.permalink:
                     progress.write(f"    API link: {vt_result.permalink}")
 
-            manifest_entries.append(
-                {
-                    "cluster_id": cluster_id,
-                    "trace_id": trace.get("trace_id"),
-                    "script_url": trace.get("script_url"),
-                    "page_url": trace.get("page_url"),
-                    "script_sha256": declared_sha or computed_sha,
-                    "ast_similarity": trace.get("ast_similarity"),
-                    "silhouette_score": trace.get("silhouette_score"),
-                    "suspicious_event_count": trace.get("suspicious_event_count"),
-                    "source_script_path": str(source_path),
-                    "sample_path": str(sample_path),
-                    "vt_result_file": str(vt_result_path) if vt_result_path else None,
-                    "vt_summary": {
-                        "verdict": vt_result.verdict_label() if vt_result else None,
-                        "detections": vt_result.detection_ratio() if vt_result else None,
-                        "error": vt_error,
-                    },
-                }
-            )
+            new_entry = {
+                "cluster_id": cluster_id,
+                "trace_id": trace_id_value,
+                "script_url": trace.get("script_url"),
+                "page_url": trace.get("page_url"),
+                "script_sha256": declared_sha or computed_sha,
+                "ast_similarity": trace.get("ast_similarity"),
+                "silhouette_score": trace.get("silhouette_score"),
+                "suspicious_event_count": trace.get("suspicious_event_count"),
+                "source_script_path": str(source_path),
+                "sample_path": str(sample_path),
+                "vt_result_file": str(vt_result_path) if vt_result_path else None,
+                "vt_summary": {
+                    "verdict": vt_result.verdict_label() if vt_result else None,
+                    "detections": vt_result.detection_ratio() if vt_result else None,
+                    "error": vt_error,
+                },
+            }
+            existing_index = entry_index_lookup.get(pair)
+            if existing_index is not None:
+                manifest_entries[existing_index] = new_entry
+            else:
+                entry_index_lookup[pair] = len(manifest_entries)
+                manifest_entries.append(new_entry)
 
             summary_label = summarize_verdict(vt_result, vt_error)
             colored_summary = colorize_label(summary_label)
@@ -717,6 +773,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 dump_manifest()
                 progress.write(f"    Partial manifest saved to {manifest_path}")
                 break
+            processed_pairs.add(pair)
     finally:
         progress.close()
         dump_manifest()
