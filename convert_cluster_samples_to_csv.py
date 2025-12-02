@@ -11,7 +11,10 @@ import json
 import re
 from collections import defaultdict
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Sequence, Set, Tuple
+from urllib.parse import parse_qsl, urlparse
+
+from scan_cluster import slugify_label
 
 
 MATCHED_VERSION_RE = re.compile(r"\[matched versions:\s*([^\]]+)\]", re.IGNORECASE)
@@ -31,10 +34,13 @@ DEFAULT_COLUMNS = [
     "unique_domains",
     "exact_plugin_matches",
     "recent_plugin_alerts",
+    "top_plugin_domain_counts",
 ]
 ROUND_DIGITS = 4
-MULTILINE_FIELDS = {"unique_urls", "unique_domains", "exact_plugin_matches", "recent_plugin_alerts"}
+MULTILINE_FIELDS = {"unique_urls", "unique_domains", "exact_plugin_matches", "recent_plugin_alerts", "top_plugin_domain_counts"}
 MULTILINE_SEPARATOR = "\n"
+RECENT_VERSION_LABEL = "unspecified"
+PLUGIN_PATH_MARKER = "/wp-content/plugins/"
 
 
 def split_top_level(text: str, delimiter: str = ";") -> List[str]:
@@ -128,32 +134,89 @@ def parse_vulnerable_plugins(text: str) -> List[Dict[str, Any]]:
     return entries
 
 
+def normalize_version_key(value: Any) -> str:
+    text = str(value).strip().lower() if value not in (None, "") else ""
+    return text or "unspecified"
+
+
+def clamp_count(value: int, limit: int) -> int:
+    if limit <= 0:
+        return max(value, 0)
+    return max(min(value, limit), 0)
+
+
 def build_vuln_columns(
-    vuln_entries: Sequence[Dict[str, Any]], plugin_distribution: Dict[str, Dict[str, int]]
+    vuln_entries: Sequence[Dict[str, Any]],
+    plugin_distribution: Dict[str, Dict[str, int]],
+    plugin_presence: Dict[str, Dict[str, Dict[str, Any]]],
+    unique_domain_count: int,
 ) -> Tuple[List[str], List[str]]:
     excluded_plugins = {"elementor", "contact-form-7"}
     grouped_matches: Dict[Tuple[str, str], List[str]] = defaultdict(list)
-    recent_alerts: List[str] = []
+    grouped_recent: Dict[Tuple[str, str], List[str]] = defaultdict(list)
+
+    def distribution_count(plugin: str, version: str | None = None) -> int:
+        counts = plugin_distribution.get(plugin, {})
+        if version is None:
+            return sum(counts.values())
+        count = counts.get(version)
+        if count is None:
+            normalized = normalize_version_key(version)
+            if normalized == "unspecified":
+                count = counts.get("unspecified", 0)
+        return count or 0
+
+    def domain_count(slug: str, version: str | None = None) -> Tuple[int, str]:
+        entries = plugin_presence.get(slug) or {}
+        if not entries:
+            return 0, RECENT_VERSION_LABEL if version is None else (version or RECENT_VERSION_LABEL)
+        if version is None:
+            observed: Set[str] = set()
+            for payload in entries.values():
+                observed.update(payload.get("domains", set()))
+            label = RECENT_VERSION_LABEL
+            if len(entries) == 1:
+                payload = next(iter(entries.values()))
+                label = payload.get("label") or RECENT_VERSION_LABEL
+            return len(observed), label
+        normalized = normalize_version_key(version)
+        payload = entries.get(normalized)
+        if not payload and normalized == "unspecified":
+            payload = entries.get("unspecified")
+        if not payload:
+            return 0, version or RECENT_VERSION_LABEL
+        return len(payload.get("domains", set())), payload.get("label") or version or RECENT_VERSION_LABEL
+
     for entry in vuln_entries:
-        plugin = entry["plugin"]
-        if plugin.lower() in excluded_plugins:
+        plugin_label = entry["plugin"]
+        if plugin_label.lower() in excluded_plugins:
             continue
         vuln_id = entry["vuln_id"] or "unknown"
+        plugin_slug = slugify_label(plugin_label)
         matched_versions = entry.get("matched_versions") or []
         if matched_versions:
-            counts = plugin_distribution.get(plugin, {})
             for version in matched_versions:
-                count = counts.get(version)
-                if count is None and version.lower() == "unspecified":
-                    count = counts.get("unspecified", 0)
-                grouped_matches[(plugin, version)].append(f"{vuln_id}:{count or 0}")
+                count, _ = domain_count(plugin_slug, version)
+                if count <= 0:
+                    count = clamp_count(distribution_count(plugin_label, version), unique_domain_count)
+                if count <= 0:
+                    continue
+                grouped_matches[(plugin_label, version)].append(f"{vuln_id}:{count}")
             continue
-        recent_alerts.append(f"{plugin}:{vuln_id}")
-    exact_entries: List[str] = []
-    for (plugin, version), values in sorted(grouped_matches.items(), key=lambda item: (item[0][0], item[0][1])):
-        joined = ",".join(values)
-        exact_entries.append(f"{plugin}:{version}:{joined}")
-    return exact_entries, sorted(recent_alerts)
+        count, label = domain_count(plugin_slug, None)
+        if count <= 0:
+            count = clamp_count(distribution_count(plugin_label, None), unique_domain_count)
+        if count <= 0:
+            continue
+        grouped_recent[(plugin_label, label or RECENT_VERSION_LABEL)].append(f"{vuln_id}:{count}")
+
+    def serialize(grouped: Dict[Tuple[str, str], List[str]]) -> List[str]:
+        entries: List[str] = []
+        for (plugin, version), values in sorted(grouped.items(), key=lambda item: (item[0][0], item[0][1])):
+            entries.append(f"{plugin}:{version}:{','.join(values)}")
+        return entries
+
+    return serialize(grouped_matches), serialize(grouped_recent)
 
 
 def sanitize_header(text: str) -> str:
@@ -196,6 +259,45 @@ def load_cluster_summaries(sample_dir: Path) -> List[Dict[str, Any]]:
     return rows
 
 
+def extract_domain(url: str | None) -> str:
+    if not url:
+        return ""
+    parsed = urlparse(url)
+    return parsed.netloc.lower()
+
+
+def load_cluster_trace_info(sample_dir: Path) -> Dict[str, Dict[str, Any]]:
+    info: Dict[str, Dict[str, Any]] = {}
+    for cluster_dir in sorted(sample_dir.glob("cluster-*")):
+        manifest_path = cluster_dir / "manifest.json"
+        if not manifest_path.exists():
+            continue
+        with manifest_path.open("r", encoding="utf-8") as fh:
+            manifest = json.load(fh)
+        cluster_id = str(manifest.get("cluster_id") or cluster_dir.name.split("-", 1)[-1])
+        traces = manifest.get("traces") or []
+        trace_ids: Set[str] = set()
+        domain_map: Dict[str, str] = {}
+        fingerprint_map: Dict[str, Path] = {}
+        for trace in traces:
+            if not isinstance(trace, dict):
+                continue
+            trace_id = trace.get("trace_id")
+            if not trace_id:
+                continue
+            trace_ids.add(trace_id)
+            page_url = trace.get("page_url") or trace.get("script_url")
+            domain = extract_domain(page_url)
+            if domain:
+                domain_map[trace_id] = domain
+            script_path = trace.get("script_path")
+            if script_path:
+                script_dir = Path(script_path).parent.parent
+                fingerprint_map[trace_id] = script_dir / "fingerprint.json"
+        info[cluster_id] = {"trace_ids": trace_ids, "domains": domain_map, "fingerprints": fingerprint_map}
+    return info
+
+
 def load_summary_rows(summary_csv: Path, cluster_ids: Iterable[str]) -> Dict[str, Dict[str, str]]:
     lookup: Dict[str, Dict[str, str]] = {}
     if not summary_csv.exists():
@@ -211,8 +313,106 @@ def load_summary_rows(summary_csv: Path, cluster_ids: Iterable[str]) -> Dict[str
     return lookup
 
 
+def extract_plugin_from_url(url: str) -> Tuple[str, str | None]:
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return "", None
+    lower_path = parsed.path.lower()
+    idx = lower_path.find(PLUGIN_PATH_MARKER)
+    if idx == -1:
+        return "", None
+    remainder = lower_path[idx + len(PLUGIN_PATH_MARKER):]
+    slug = remainder.split("/", 1)[0].strip()
+    if not slug:
+        return "", None
+    version = None
+    query = parsed.query
+    if query:
+        if "=" not in query:
+            version = query
+        else:
+            for key, value in parse_qsl(query, keep_blank_values=True):
+                if key == "ver" and value:
+                    version = value
+                    break
+    return slugify_label(slug), version
+
+
+def parse_fingerprint_plugins(fingerprint_path: Path) -> List[Dict[str, Any]]:
+    try:
+        with fingerprint_path.open("r", encoding="utf-8") as fh:
+            fingerprint = json.load(fh)
+    except FileNotFoundError:
+        return []
+    except json.JSONDecodeError as exc:
+        print(f"[WARN] Failed to parse fingerprint {fingerprint_path}: {exc}", file=sys.stderr)
+        return []
+    plugin_versions: Dict[str, Set[str]] = defaultdict(set)
+    for url in fingerprint.get("resource_urls_with_wp_paths") or []:
+        slug, version = extract_plugin_from_url(url)
+        if not slug:
+            continue
+        plugin_versions[slug].add((version or RECENT_VERSION_LABEL).strip())
+    plugins: List[Dict[str, Any]] = []
+    for slug, versions in plugin_versions.items():
+        for version in versions:
+            plugins.append(
+                {
+                    "slug": slug,
+                    "version": None if version == RECENT_VERSION_LABEL else version,
+                }
+            )
+    return plugins
+
+
+def build_cluster_plugin_presence(
+    cluster_trace_info: Dict[str, Dict[str, Any]],
+) -> Dict[str, Dict[str, Dict[str, Any]]]:
+    presence: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    for cluster_id, info in cluster_trace_info.items():
+        trace_ids: Set[str] = info.get("trace_ids", set())  # type: ignore[assignment]
+        domain_map: Dict[str, str] = info.get("domains", {})
+        fingerprint_map: Dict[str, Path] = info.get("fingerprints", {})
+        plugin_map: Dict[str, Dict[str, Any]] = {}
+        for trace_id in trace_ids or []:
+            domain = domain_map.get(trace_id)
+            if not domain:
+                continue
+            fingerprint_path = fingerprint_map.get(trace_id)
+            plugins = parse_fingerprint_plugins(fingerprint_path) if fingerprint_path else []
+            for plugin in plugins:
+                if not isinstance(plugin, dict):
+                    continue
+                slug = plugin.get("slug")
+                if not slug:
+                    continue
+                version = plugin.get("version")
+                normalized = normalize_version_key(version)
+                label = str(version).strip() if version not in (None, "") else RECENT_VERSION_LABEL
+                plugin_entry = plugin_map.setdefault(slug, {})
+                version_entry = plugin_entry.setdefault(normalized, {"label": label, "domains": set()})
+                version_entry["domains"].add(domain)
+        presence[cluster_id] = plugin_map
+    return presence
+
+
+def summarize_top_plugins_by_domain(plugin_data: Dict[str, Dict[str, Any]], limit: int = 5) -> List[str]:
+    entries: List[Tuple[str, int]] = []
+    for slug, versions in plugin_data.items():
+        domains: Set[str] = set()
+        for payload in versions.values():
+            domains.update(payload.get("domains", set()))
+        if domains:
+            entries.append((slug, len(domains)))
+    entries.sort(key=lambda item: (-item[1], item[0]))
+    return [f"{slug}:{count}" for slug, count in entries[:max(limit, 0)]]
+
+
 def enrich_with_summary_data(
-    rows: List[Dict[str, Any]], summary_rows: Dict[str, Dict[str, str]]
+    rows: List[Dict[str, Any]],
+    summary_rows: Dict[str, Dict[str, str]],
+    plugin_presence: Dict[str, Dict[str, Dict[str, Any]]],
 ) -> None:
     for row in rows:
         cluster_id = str(row.get("cluster_id"))
@@ -228,9 +428,18 @@ def enrich_with_summary_data(
             row[sanitized] = value
         plugin_distribution = parse_asset_distribution(summary_row.get("Cluster WordPress Distribution - Plugins", ""))
         vuln_entries = parse_vulnerable_plugins(summary_row.get("Vulnerable Plugins", ""))
-        exact_entries, recent_alerts = build_vuln_columns(vuln_entries, plugin_distribution)
+        cluster_plugins = plugin_presence.get(cluster_id) or {}
+        unique_domain_count = parse_int(str(row.get("unique_domain_count"))) if row.get("unique_domain_count") is not None else 0
+        exact_entries, recent_alerts = build_vuln_columns(
+            vuln_entries,
+            plugin_distribution,
+            cluster_plugins,
+            unique_domain_count,
+        )
         row["exact_plugin_matches"] = " | ".join(exact_entries)
         row["recent_plugin_alerts"] = " | ".join(recent_alerts)
+        top_plugin_entries = summarize_top_plugins_by_domain(cluster_plugins, limit=5)
+        row["top_plugin_domain_counts"] = " | ".join(top_plugin_entries)
 
 
 def format_numeric(value: Any, digits: int) -> str:
@@ -307,7 +516,11 @@ def main() -> None:
 
     summary_csv = Path(args.summary_csv) if args.summary_csv else sample_dir / f"{args.cache_id}_summary.csv"
     summary_rows = load_summary_rows(summary_csv, {str(row.get("cluster_id")) for row in rows})
-    enrich_with_summary_data(rows, summary_rows)
+
+    cluster_trace_info = load_cluster_trace_info(sample_dir)
+    plugin_presence = build_cluster_plugin_presence(cluster_trace_info)
+
+    enrich_with_summary_data(rows, summary_rows, plugin_presence)
 
     apply_formatting(rows, ROUND_DIGITS, MULTILINE_FIELDS, MULTILINE_SEPARATOR)
 
