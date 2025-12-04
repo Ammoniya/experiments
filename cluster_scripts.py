@@ -38,6 +38,7 @@ except ImportError:  # pragma: no cover - optional dependency
     subsequence_alignment = None
 
 from cluster_neighbors import compute_cluster_neighbors
+from trace_heuristics import evaluate_trace
 
 CAPABILITY_EXACT_MAP = {
     'XHR Request': 'NET_XHR',
@@ -1505,6 +1506,10 @@ class ScriptClusterer:
                     ):
                         filtered_low_suspicious_events += 1
                         continue
+
+                    heuristic_matches = evaluate_trace(trace)
+                    trace['heuristic_hits'] = [match.to_dict() for match in heuristic_matches]
+                    trace['heuristic_names'] = [match.name for match in heuristic_matches]
 
                     self.traces.append(trace)
 

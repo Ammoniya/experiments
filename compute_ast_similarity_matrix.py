@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+    #!/usr/bin/env python3
 """
 Compute pairwise AST cosine similarities that stay index-aligned with the
 cached DTW distance matrix (cache/dtw_matrix_latest.npz by default).
