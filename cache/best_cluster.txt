@@ -1,7 +1,0 @@
-all-3   With dtw filter all till 19
-* all-5   NO dtw filter all till 21
-all-7   Sucks
-* all-9   fix DTW super sensetivity
-* all-10  fix DTW super sensetivity with dropped data point accuracy 
-* all-11  fix DTW super sensetivity with dropped data point accuracy _ with new data
-* all-12  fix DTW super sensetivity with dropped data point accuracy _ with new data
